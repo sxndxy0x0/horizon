@@ -53,7 +53,8 @@ import org.objectweb.asm.util.TraceMethodVisitor;
  */
 public final class Probe {
     static final String MERGED = "Lorg/spongepowered/asm/mixin/transformer/meta/MixinMerged;";
-    static final String HEAD = "class\tmethod\tcode\taccess\trefs\tmixins\n";
+    static final Set<String> DUMP = Set.of(System.getProperty("probe.dump", "").split(","));
+    static final String HEAD ="class\tmethod\tcode\taccess\trefs\tmixins\tlines\n";
 
     private Probe() {}
 
@@ -95,11 +96,15 @@ public final class Probe {
         Files.createDirectories(Agent.out);
         Mixins mixins = new Mixins(Agent.mods);
         int loaded = 0;
+        int onDisk = 0;
+        Map<String, ZipFile> sources = new HashMap<>();
         try (ZipFile jar = new ZipFile(Agent.vanillaJar.toFile());
                 BufferedWriter vanilla = writer("vanilla.tsv");
+                BufferedWriter disk = writer("ondisk.tsv");
                 BufferedWriter codes = writer("code.tsv");
                 BufferedWriter fails = writer("failed.tsv")) {
             vanilla.write(HEAD);
+            disk.write(HEAD);
             codes.write(HEAD);
             for (String f : failed) {
                 fails.write(f + "\n");
@@ -113,6 +118,25 @@ public final class Probe {
                 if (after != null) {
                     loaded++;
                     rows(codes, node(after), mixins);
+                    if (DUMP.contains(name)) {
+                        // -Dprobe.dump=a/B,c/D: a class as the game runs it, for looking at by hand (javap).
+                        java.nio.file.Path file = Agent.out.resolve("dump").resolve(name + ".class");
+                        Files.createDirectories(file.getParent());
+                        Files.write(file, after);
+                    }
+                }
+                // The class as the loader's jar holds it, before runtime transforms (mixins, access transformers,
+                // coremods): what the loader patched on disk, told apart from what it changes while loading.
+                byte[] stored = stored(sources, Agent.SOURCE.get(name), name);
+                if (stored != null) {
+                    onDisk++;
+                    rows(disk, node(stored), null);
+                }
+            }
+        } finally {
+            for (ZipFile z : sources.values()) {
+                if (z != null) {
+                    z.close();
                 }
             }
         }
@@ -120,10 +144,120 @@ public final class Probe {
             s.write("vanilla_classes\t" + Agent.VANILLA.size() + "\n");
             s.write("loaded_classes\t" + loaded + "\n");
             s.write("load_failures\t" + failed.size() + "\n");
+            s.write("classes_read_from_the_loaders_jar\t" + onDisk + "\n");
             s.write("mixin_classes_in_mods\t" + mixins.seen() + "\n");
             s.write("vanilla_classes_mixins_target\t" + mixins.targets() + "\n");
         }
         System.out.printf("[probe] %d vanilla classes, %d loaded, %d failed%n", Agent.VANILLA.size(), loaded, failed.size());
+    }
+
+    /**
+     * A method's first and last source line ({@code 12-40}), from its line number table and those of the lambdas
+     * it creates (their bodies are its source too, as {@link #refs} folds them in); empty without one.
+     */
+    static String lines(MethodNode m, Map<String, MethodNode> byKey, String owner) {
+        int[] range = {Integer.MAX_VALUE, Integer.MIN_VALUE};
+        span(m, byKey, owner, range, new HashSet<>());
+        return range[0] == Integer.MAX_VALUE ? "" : range[0] + "-" + range[1];
+    }
+
+    private static void span(MethodNode m, Map<String, MethodNode> byKey, String owner, int[] range, Set<String> seen) {
+        if (!seen.add(m.name + m.desc)) {
+            return;
+        }
+        for (AbstractInsnNode insn : m.instructions) {
+            if (insn instanceof org.objectweb.asm.tree.LineNumberNode n) {
+                range[0] = Math.min(range[0], n.line);
+                range[1] = Math.max(range[1], n.line);
+            } else if (insn instanceof InvokeDynamicInsnNode d
+                    && d.bsm.getOwner().equals("java/lang/invoke/LambdaMetafactory")
+                    && d.bsmArgs.length > 1 && d.bsmArgs[1] instanceof Handle impl
+                    && impl.getOwner().equals(owner) && impl.getName().startsWith("lambda$")) {
+                MethodNode body = byKey.get(impl.getName() + impl.getDesc());
+                if (body != null) {
+                    span(body, byKey, owner, range, seen);
+                }
+            }
+        }
+    }
+
+    /** A class's supertype, sorted interfaces, sorted fields (name, type) and annotations. */
+    static String shape(ClassNode c) {
+        Set<String> fields = new TreeSet<>();
+        for (FieldNode f : c.fields) {
+            // A synthetic field (a captured value, a switch map) comes and goes with a recompile.
+            if ((f.access & org.objectweb.asm.Opcodes.ACC_SYNTHETIC) == 0) {
+                fields.add(f.name + ":" + f.desc);
+            }
+        }
+        Set<String> annotations = new TreeSet<>();
+        for (List<AnnotationNode> list : Arrays.asList(c.visibleAnnotations, c.invisibleAnnotations)) {
+            if (list != null) {
+                list.forEach(a -> annotations.add(a.desc));
+            }
+        }
+        return "super " + c.superName + " | interfaces " + new TreeSet<>(c.interfaces) + " | fields " + fields
+                + " | annotations " + annotations;
+    }
+
+    /** Each non-synthetic field's access flags, sorted by name. */
+    static String fieldAccess(ClassNode c) {
+        Set<String> out = new TreeSet<>();
+        for (FieldNode f : c.fields) {
+            if ((f.access & org.objectweb.asm.Opcodes.ACC_SYNTHETIC) == 0) {
+                out.add(f.name + ":" + f.access);
+            }
+        }
+        return String.join(",", out);
+    }
+
+    /**
+     * A class's bytes from the jar its code source names: {@code file:/x.jar}, {@code jar:file:/x.jar!/} or a
+     * loader's union path ({@code union:/x.jar%23123!/}). Null when the source is not a jar on disk.
+     */
+    static byte[] stored(Map<String, ZipFile> jars, String location, String name) {
+        if (location == null) {
+            return null;
+        }
+        ZipFile jar = jars.computeIfAbsent(location, Probe::openJar);
+        if (jar == null) {
+            return null;
+        }
+        ZipEntry entry = jar.getEntry(name + ".class");
+        if (entry == null) {
+            return null;
+        }
+        try (InputStream in = jar.getInputStream(entry)) {
+            return in.readAllBytes();
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
+    static ZipFile openJar(String location) {
+        String s = location;
+        for (String prefix : new String[] {"jar:", "union:"}) {
+            if (s.startsWith(prefix)) {
+                s = s.substring(prefix.length());
+            }
+        }
+        int bang = s.indexOf("!/");
+        if (bang >= 0) {
+            s = s.substring(0, bang);
+        }
+        int hash = s.indexOf("%23");
+        if (hash >= 0) {
+            s = s.substring(0, hash);
+        }
+        if (!s.startsWith("file:")) {
+            s = "file:" + (s.startsWith("/") ? "" : "/") + s;
+        }
+        try {
+            java.nio.file.Path path = java.nio.file.Path.of(java.net.URI.create(s));
+            return Files.isRegularFile(path) ? new ZipFile(path.toFile()) : null;
+        } catch (IOException | RuntimeException e) {
+            return null;
+        }
     }
 
     static void rows(BufferedWriter out, ClassNode c, Mixins mixins) throws IOException {
@@ -131,10 +265,17 @@ public final class Probe {
         for (MethodNode m : c.methods) {
             byKey.put(m.name + m.desc, m);
         }
+        // The class itself, as one row: its supertypes, interfaces and fields, which a patch or a mixin may change
+        // without touching any method.
+        String shape = shape(c);
+        String onClass = mixins == null ? "" : String.join(",", mixins.onClass(c));
+        // Access: the class's own and its fields', so a widened field reads as an access change, not a new shape.
+        String access = c.access + ";" + hash(fieldAccess(c));
+        out.write(c.name + "\t<class>\t" + hash(shape) + "\t" + access + "\t" + hash(renumbered(shape)) + "\t" + onClass + "\t\n");
         for (MethodNode m : c.methods) {
             String who = mixins == null ? "" : String.join(",", mixins.behind(c, m, byKey));
             out.write(c.name + "\t" + m.name + m.desc + "\t" + hash(code(m)) + "\t" + m.access + "\t" + hash(refs(m, byKey, c.name)) + "\t"
-                    + who + "\n");
+                    + who + "\t" + lines(m, byKey, c.name) + "\n");
         }
     }
 
@@ -143,7 +284,8 @@ public final class Probe {
      * mixin config's classes and their {@code @Mixin} targets. Loader-neutral, as every loader here runs Mixin.
      */
     static final class Mixins {
-        record Ref(String mixin, Set<String> members) {}
+        /** A mixin, the members it declares, and the interfaces it adds to its targets. */
+        record Ref(String mixin, Set<String> members, Set<String> interfaces) {}
 
         private final Map<String, List<Ref>> byTarget = new HashMap<>();
         private int mixinClasses;
@@ -167,6 +309,39 @@ public final class Probe {
 
         int targets() {
             return byTarget.size();
+        }
+
+        /** Every mixin on a class, as "?" candidates: a change to the class's shape is one of theirs. */
+        List<String> onClass(ClassNode c) {
+            // The mixins that declare one of its fields or add one of its interfaces; else every mixin on it.
+            List<Ref> refs = byTarget.getOrDefault(c.name, List.of());
+            Set<String> fields = new HashSet<>();
+            for (FieldNode f : c.fields) {
+                fields.add(f.name);
+            }
+            List<String> out = new ArrayList<>();
+            for (Ref ref : refs) {
+                if (ref.members().stream().anyMatch(fields::contains)
+                        || ref.interfaces().stream().anyMatch(c.interfaces::contains)
+                        // An accessor or invoker mixin is an interface its target comes to implement.
+                        || c.interfaces.contains(ref.mixin().replace('.', '/'))) {
+                    out.add(ref.mixin());
+                }
+            }
+            for (String i : c.interfaces) {
+                // An interface from outside the game (injected by a mod, as Fabric API's FabricTooltipFlag): the
+                // report names the mod whose jar holds it.
+                if (!i.startsWith("net/minecraft/") && !i.startsWith("com/mojang/") && !i.startsWith("java/")
+                        && out.stream().noneMatch(m -> m.replace('.', '/').equals(i))) {
+                    out.add("@" + i.replace('/', '.'));
+                }
+            }
+            if (out.isEmpty()) {
+                for (Ref ref : refs) {
+                    out.add("?" + ref.mixin());
+                }
+            }
+            return out;
         }
 
         private void scan(byte[] jar) throws IOException {
@@ -218,7 +393,7 @@ public final class Probe {
                     own.add(m.name);
                 }
             }
-            Ref ref = new Ref(mixin, own);
+            Ref ref = new Ref(mixin, own, new HashSet<>(node.interfaces));
             for (List<AnnotationNode> list : Arrays.asList(node.visibleAnnotations, node.invisibleAnnotations)) {
                 if (list == null) {
                     continue;
@@ -358,7 +533,13 @@ public final class Probe {
                         out.add("M" + renumbered(c.owner) + "." + accessor(c.name) + c.desc);
                     }
                 }
-                case FieldInsnNode f -> out.add("F" + f.getOpcode() + renumbered(f.owner) + "." + f.name);
+                case FieldInsnNode f -> {
+                    // A captured value (val$x) or outer instance (this$0): a recompile may capture it or read it
+                    // where it came from.
+                    if (!f.name.startsWith("val$") && !f.name.startsWith("this$")) {
+                        out.add("F" + f.getOpcode() + renumbered(f.owner) + "." + f.name);
+                    }
+                }
                 case TypeInsnNode t -> {
                     if (!t.desc.equals("java/lang/MatchException")) {
                         out.add("T" + t.getOpcode() + renumbered(t.desc));

@@ -29,6 +29,9 @@ public final class Agent {
     /** The final bytes of each vanilla class, as the game's loader defined it. */
     static final Map<String, byte[]> FINAL = new ConcurrentHashMap<>();
 
+    /** Where the loader read each vanilla class from (its code source), before any runtime transform. */
+    static final Map<String, String> SOURCE = new ConcurrentHashMap<>();
+
     /** The game's entry classes: the client's and the dedicated server's. */
     static final Set<String> TRIGGERS = Set.of("net/minecraft/client/main/Main", "net/minecraft/server/Main");
 
@@ -62,6 +65,9 @@ public final class Agent {
                     return null;
                 }
                 FINAL.put(name, bytes.clone());
+                if (domain != null && domain.getCodeSource() != null && domain.getCodeSource().getLocation() != null) {
+                    SOURCE.put(name, domain.getCodeSource().getLocation().toString());
+                }
                 return TRIGGERS.contains(name) ? hookMain(bytes) : null;
             }
         });

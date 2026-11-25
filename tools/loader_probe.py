@@ -313,18 +313,23 @@ def read_summary(out: Path) -> dict[str, str]:
     return dict(line.split("\t") for line in (out / "summary.tsv").read_text(encoding="utf-8").splitlines() if line)
 
 
+ACCESSOR = re.compile(r"access\$\d+\(")
+
+
 def lambda_method(key: tuple[str, str]) -> bool:
-    return key[1].startswith("lambda$")
+    """A method whose name a recompile renumbers: a lambda body or a synthetic accessor (access$100). Compared
+    only through the methods that call them."""
+    return key[1].startswith("lambda$") or bool(ACCESSOR.match(key[1]))
 
 
-def classify(before: dict, after: dict, recompiled: bool) -> dict[tuple[str, str], str]:
-    """Each method that differs: changed (code), access (flags only), added, removed.
+ANONYMOUS = re.compile(r"\$\d+(?=$|\$)")
 
-    With recompiled, a method whose code differs but whose references match is "recompile" (a decompile-and-recompile
-    moved it around), not "changed". Lambdas, whose synthetic names a recompile renumbers, are compared only by
-    the methods that call them.
-    """
-    out: dict[tuple[str, str], str] = {}
+
+def anonymous(name: str) -> bool:
+    return bool(ANONYMOUS.search(name))
+
+
+def compare(before: dict, after: dict, recompiled: bool, out: dict[tuple[str, str], str]) -> None:
     for key, a in after.items():
         if recompiled and lambda_method(key):
             # lambda$m$0 before and after may be different lambdas.
@@ -341,8 +346,58 @@ def classify(before: dict, after: dict, recompiled: bool) -> dict[tuple[str, str
     for key in before:
         if key not in after and not (recompiled and lambda_method(key)):
             out[key] = "removed"
-    return out
 
+
+def anonymous_bags(rows: dict) -> dict[tuple, list[tuple[str, tuple]]]:
+    """Anonymous classes grouped by their renumbered name and method names: (class, signature) per class, where the
+    signature is each method's references and access, so classes a recompile renumbered still meet."""
+    by_class: dict[str, list] = collections.defaultdict(list)
+    for (cls, method), r in rows.items():
+        # The constructor carries the captured values, which a recompile may capture differently.
+        if anonymous(cls) and not lambda_method((cls, method)) and not method.startswith("<init>"):
+            by_class[cls].append((method, r["refs"], r["access"]))
+    bags: dict[tuple, list] = collections.defaultdict(list)
+    for cls, entries in by_class.items():
+        entries.sort()
+        bags[(ANONYMOUS.sub("$#", cls), tuple(m for m, _, _ in entries))].append((cls, tuple(entries)))
+    return bags
+
+
+def classify(before: dict, after: dict, recompiled: bool) -> dict[tuple[str, str], str]:
+    """Each method that differs: changed (code), access (flags only), added, removed.
+
+    With recompiled, a method whose code differs but whose references match is "recompile" (a decompile-and-recompile
+    moved it around), not "changed". Lambdas, whose synthetic names a recompile renumbers, are compared only by
+    the methods that call them, and anonymous classes (renumbered too) are matched by their shape instead of their
+    number: Outer$3 before may be Outer$5 after.
+    """
+    out: dict[tuple[str, str], str] = {}
+    if not recompiled:
+        compare(before, after, False, out)
+        return out
+    compare({k: v for k, v in before.items() if not anonymous(k[0])},
+            {k: v for k, v in after.items() if not anonymous(k[0])}, True, out)
+    bags_before, bags_after = anonymous_bags(before), anonymous_bags(after)
+    for group in set(bags_before) | set(bags_after):
+        left = collections.Counter(sig for _, sig in bags_before.get(group, []))
+        unmatched = []
+        for cls, sig in bags_after.get(group, []):
+            if left[sig] > 0:
+                left[sig] -= 1
+            else:
+                unmatched.append(cls)
+        status = "changed" if group in bags_before else "added"
+        for cls in unmatched:
+            for method in group[1]:
+                out[(cls, method)] = status
+        # Classes before that nothing after matched (gone, or the before side of a changed one).
+        for cls, sig in bags_before.get(group, []):
+            if left[sig] > 0:
+                left[sig] -= 1
+                if not unmatched:
+                    for method in group[1]:
+                        out[(cls, method)] = "removed"
+    return out
 
 def table(lines: list[str], title: str, counts: collections.Counter[str]) -> None:
     lines += ["", f"### {title}", "", "| by | methods |", "|---|---:|"]
@@ -375,7 +430,8 @@ def section(lines: list[str], title: str, status: dict[tuple[str, str], str], af
                 by[o] += 1
                 sub_by[sub][o] += 1
         elif s == "access":
-            for o in owners(key, "", s):
+            # A mixin may widen too: Mixin upgrades a member to the access its mixin declares.
+            for o in owners(key, after.get(key, {}).get("mixins", ""), s):
                 access_by[o] += 1
     table(lines, "Code changed, by who", by)
     if access_by:
@@ -383,25 +439,122 @@ def section(lines: list[str], title: str, status: dict[tuple[str, str], str], af
     subsystem_table(lines, "Code changed, by subsystem (an accelerator is blocked where its methods changed)", by_sub, sub_by)
 
 
-def check_patches(lines: list[str], status: dict[tuple[str, str], str], patches: Path) -> None:
-    """Compare the classes the probe finds the loader changed with the loader's own source patch files
-    (one path per line, like NeoForge's patches/net/minecraft/.../X.java.patch)."""
-    patched = set()
-    for line in patches.read_text(encoding="utf-8").splitlines():
+def patch_lines(text: str) -> set[int]:
+    """The lines a unified diff changes, numbered in the new file: each added line, and both sides of a removal.
+
+    NeoForge's patches leave the new side's start out (`@@ -250,11 +_,14 @@`): it is the old start moved by
+    what the earlier hunks added and removed."""
+    changed: set[int] = set()
+    line = 0
+    offset = 0
+    in_hunk = False
+    for raw in text.splitlines():
+        m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+|_)(?:,\d+)? @@", raw)
+        if m:
+            line = int(m.group(1)) + offset if m.group(2) == "_" else int(m.group(2))
+            in_hunk = True
+        elif not in_hunk or raw.startswith("\\"):
+            continue
+        elif raw.startswith("+"):
+            changed.add(line)
+            line += 1
+            offset += 1
+        elif raw.startswith("-"):
+            changed.update((line - 1, line))
+            offset -= 1
+        else:
+            line += 1
+    return changed
+
+
+def read_patches(patches: Path) -> dict[str, set[int] | None]:
+    """The classes a loader's source patches name, with the lines each changes when the patch files themselves are
+    given (a folder of patches/<class>.java.patch), or without lines for a list of their paths."""
+    out: dict[str, set[int] | None] = {}
+    if patches.is_dir():
+        for f in patches.rglob("*.java.patch"):
+            rel = f.relative_to(patches).as_posix().removeprefix("patches/")
+            out[rel[: -len(".java.patch")]] = patch_lines(f.read_text(encoding="utf-8", errors="replace"))
+        return out
+    for line in patches.read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if line.endswith(".java.patch"):
-            patched.add(line.removeprefix("patches/")[: -len(".java.patch")])
+            out[line.removeprefix("patches/")[: -len(".java.patch")]] = None
+    return out
+
+
+def top_class(name: str) -> str:
+    return name.split("$", 1)[0]
+
+
+def line_range(row: dict[str, str] | None) -> tuple[int, int] | None:
+    text = (row or {}).get("lines", "")
+    if not text:
+        return None
+    lo, hi = text.split("-")
+    return int(lo), int(hi)
+
+
+def settle(status: dict[tuple[str, str], str], patched: dict[str, set[int] | None],
+           disk: dict[tuple[str, str], dict[str, str]] | None = None) -> tuple[dict[tuple[str, str], str], int]:
+    """Decide the recompile's leftovers with the loader's source patches. The loader's jar is the recompiled game
+    plus those patches, compiled with line numbers, so: a method in a class no patch names is the recompile only;
+    with the patch files, a method of a patched class is changed exactly when the patch touches its lines (a
+    patch that only changes a constant or a comparison counts, a recompiled neighbour does not), and patched
+    lines outside every method (an annotation, a field, a signature) mark the class itself. Returns the settled
+    statuses and how many methods the patches settled."""
+    settled = 0
+    out = dict(status)
+    ranges: dict[str, list[tuple[tuple[str, str], tuple[int, int]]]] = collections.defaultdict(list)
+    for key, row in (disk or {}).items():
+        r = line_range(row)
+        if r:
+            ranges[top_class(key[0])].append((key, r))
+    for key, s in status.items():
+        cls = top_class(key[0])
+        lines = patched.get(cls, ())
+        if cls not in patched:
+            if s == "changed":
+                out[key] = "recompile"
+                settled += 1
+        elif lines is not None and s in ("changed", "recompile") and key[1] != "<class>":
+            r = line_range((disk or {}).get(key))
+            if r:
+                hit = any(r[0] <= n <= r[1] for n in lines)
+                if (s == "changed") != hit:
+                    settled += 1
+                out[key] = "changed" if hit else "recompile"
+    for cls, lines in patched.items():
+        if not lines:
+            continue
+        covered = {n for _, (lo, hi) in ranges.get(cls, []) for n in lines if lo <= n <= hi}
+        if lines - covered and out.get((cls, "<class>"), "recompile") == "recompile":
+            out[(cls, "<class>")] = "changed"
+    return out, settled
+
+def check_patches(lines: list[str], status: dict[tuple[str, str], str], patched: set[str], settled: int) -> None:
+    """Compare the classes the probe finds the loader's jar changed with the loader's source patch files."""
     # A patch may only widen access, add a method or drop one, as well as change code.
-    found = {k[0].split("$", 1)[0] for k, s in status.items() if s != "recompile"}
+    kinds: dict[str, set[str]] = collections.defaultdict(set)
+    for k, s in status.items():
+        if s != "recompile":
+            kinds[top_class(k[0])].add(s)
+    found = set(kinds)
     both = found & patched
+    only = found - patched
+    # The access transformer the installer applies to the jar widens classes no source patch names.
+    access_only = {c for c in only if kinds[c] == {"access"}}
+    other = only - access_only
     lines += ["", "### Against the loader's source patches", "",
               f"- source patch files: {len(patched)}",
+              f"- methods the source patches settled against the references: {settled}",
               f"- classes the probe finds changed: {len(found)}",
-              f"- in both: {len(both)} ({100 * len(both) / max(1, len(found)):.1f}% of the probe's, "
-              f"{100 * len(both) / max(1, len(patched)):.1f}% of the patches')",
-              f"- probe only (first 15): {', '.join(sorted(found - patched)[:15]) or 'none'}",
-              f"- patches only (first 15): {', '.join(sorted(patched - found)[:15]) or 'none'}"]
-
+              f"- in both: {len(both)} ({100 * len(both) / max(1, len(patched)):.1f}% of the patches)",
+              f"- no patch, access only (the loader's access transformer): {len(access_only)}",
+              f"- no patch, methods added or removed: {len(other)}"
+              + (f" ({', '.join(sorted(other)[:10])})" if other else ""),
+              f"- patches the probe finds nothing in: {len(patched - found)}"
+              + (f" ({', '.join(sorted(patched - found)[:10])})" if patched - found else "")]
 
 def attribute(key: tuple[str, str], mixins: str, status: str, fallback: str, classes: dict[str, str],
               access: dict[tuple[str, str | None], set[str]], coremods: dict[str, set[str]],
@@ -409,16 +562,24 @@ def attribute(key: tuple[str, str], mixins: str, status: str, fallback: str, cla
     """Who changed a method, most certain first: the mixins merged into it or using their members; the mods
     that widen it (access) or whose coremods name its class (code); the one mod all the mixins on its class
     come from; the loader, for a method the loader itself added; else the fallback."""
-    named = [m for m in mixins.split(",") if m and not m.startswith("?")]
+    entries = [m for m in mixins.split(",") if m and not m.startswith("?")]
+    # A mixin, or ("@") an interface from outside the game the class implements: the mod whose jar holds it. An
+    # interface no mod holds is the loader's or a library's (NeoForge's IKeyMappingExtension), not evidence.
+    named = {classes.get(m, "(not in a mod jar: " + m + ")") for m in entries if not m.startswith("@")}
+    named |= {classes[m[1:]] for m in entries if m.startswith("@") and m[1:] in classes}
     if named:
-        return {classes.get(m, "(mixin not in a mod jar: " + m + ")") for m in named}
+        return named
     if status == "access":
-        widened = access.get((key[0], key[1].split("(", 1)[0])) or access.get((key[0], None))
+        if key[1] == "<class>":
+            # The class's or one of its fields' flags: any mod widening something of this class.
+            widened = set().union(*(mods for (cls, _), mods in access.items() if cls == key[0]))
+        else:
+            widened = access.get((key[0], key[1].split("(", 1)[0])) or access.get((key[0], None))
         if widened:
             return set(widened)
     elif coremods.get(key[0]):
         return set(coremods[key[0]])
-    candidates = {classes.get(m[1:], "(mixin not in a mod jar: " + m[1:] + ")") for m in mixins.split(",")
+    candidates = {classes.get(m[1:], "(not in a mod jar: " + m[1:] + ")") for m in mixins.split(",")
                   if m.startswith("?")}
     if len(candidates) == 1:
         return candidates
@@ -442,12 +603,33 @@ def report(out: Path, mods: Path, baseline: Path | None, patches: Path | None = 
 
     lines = ["# Loader probe report", ""]
     lines += [f"- {k}: {v}" for k, v in read_summary(out).items()]
+    loader_dir = baseline if base is not None else out
     loader_rows = base if base is not None else final
-    loader_status = classify(vanilla, loader_rows, recompiled=True)
-    section(lines, "The loader against the vanilla jar" + ("" if base is not None else " (mods included: no baseline)"),
-            loader_status, loader_rows, lambda k, m, s: owners(k, m, s, "(the loader)"))
-    if patches:
-        check_patches(lines, loader_status, patches)
+    suffix = "" if base is not None else " (mods included: no baseline)"
+    disk_file = loader_dir / "ondisk.tsv"
+    if disk_file.exists():
+        # The loader's jar as stored (its install-time patches, against vanilla), then what loading it changes
+        # (runtime transforms, against that jar), each told apart instead of mixed.
+        stored = methods(disk_file)
+        # Whole classes: a class read from the loader's jar replaces the vanilla one, methods it dropped included.
+        stored_classes = {k[0] for k in stored}
+        disk = {k: v for k, v in vanilla.items() if k[0] not in stored_classes} | stored
+        disk_status = classify(vanilla, disk, recompiled=True)
+        patched = read_patches(patches) if patches else None
+        if patched is not None:
+            disk_status, settled = settle(disk_status, patched, disk)
+        section(lines, "The loader's jar against the vanilla jar" + suffix, disk_status, disk,
+                lambda k, m, s: owners(k, m, s, "(the loader's jar)"))
+        if patched is not None:
+            check_patches(lines, disk_status, set(patched), settled)
+        section(lines, "What the loader changes while loading" + suffix, classify(disk, loader_rows, recompiled=False),
+                loader_rows, lambda k, m, s: owners(k, m, s, "(the loader at runtime)"))
+    else:
+        loader_status = classify(vanilla, loader_rows, recompiled=True)
+        section(lines, "The loader against the vanilla jar" + suffix, loader_status, loader_rows,
+                lambda k, m, s: owners(k, m, s, "(the loader)"))
+        if patches:
+            check_patches(lines, loader_status, set(read_patches(patches)), 0)
     if base is not None:
         mod_status = classify(base, final, recompiled=False)
         section(lines, "The mods against the same loader without mods", mod_status, final,
@@ -469,7 +651,9 @@ def main() -> int:
                     help="where to find libraries missing from <minecraft>/libraries (default: the launcher's own, read only)")
     ap.add_argument("--no-baseline", action="store_true", help="skip the run of the loader without mods")
     ap.add_argument("--loader-patches", type=Path,
-                    help="a list of the loader's source patch files (patches/<class>.java.patch), to check the probe against")
+                    help="the loader's source patches: a folder of patches/<class>.java.patch files (decides each method "
+                         "of a recompiled jar by the lines its patch touches), or a list of their paths (by class)")
+    ap.add_argument("--dump", default="", help="classes to write as the game runs them, to <out>/dump (a/B,c/D)")
     ap.add_argument("--report-only", action="store_true", help="rebuild report.md from the last run")
     args = ap.parse_args()
 
@@ -520,10 +704,10 @@ def main() -> int:
         # NeoForge's loading window would open before the game's main; the probe exits before any window.
         (game_dir / "config").mkdir()
         (game_dir / "config" / "fml.toml").write_text("earlyWindowControl = false\n", encoding="utf-8")
-        for name in ("vanilla.tsv", "code.tsv", "failed.tsv", "summary.tsv", "report.md"):
+        for name in ("vanilla.tsv", "ondisk.tsv", "code.tsv", "failed.tsv", "summary.tsv", "report.md"):
             (where / name).unlink(missing_ok=True)
         # Headless: a loader's error window would wait for a click instead of exiting.
-        cmd = [java, "-Xmx3g", "-Djava.awt.headless=true", f"-Djava.library.path={natives}",
+        cmd = [java, "-Xmx3g", "-Djava.awt.headless=true", f"-Dprobe.dump={args.dump}", f"-Djava.library.path={natives}",
                f"-Dorg.lwjgl.librarypath={natives}", f"-javaagent:{agent}={pristine}|{where}|{game_dir / 'mods'}",
                f"-Dfabric.gameJarPath={game_jar}", *profile_args(profile_json, versions, libraries, "jvm"),
                "-cp", os.pathsep.join(map(str, [*libs, game_jar])), main_class,

@@ -29,11 +29,44 @@ class ClassifyTests(unittest.TestCase):
         self.assertEqual(probe.classify(before, after, recompiled=True),
                          {("a/A", "m()V"): "recompile", ("a/A", "n()V"): "changed", ("a/A", "o()V"): "access"})
 
+    def test_renumbered_anonymous_classes_are_matched_by_shape(self):
+        before = {("a/A$1", "run()V"): row("x", "go"), ("a/A$2", "run()V"): row("y", "stop")}
+        same = {("a/A$7", "run()V"): row("x2", "stop"), ("a/A$8", "run()V"): row("y2", "go")}
+        self.assertEqual(probe.classify(before, same, recompiled=True), {})
+        patched = {("a/A$7", "run()V"): row("x2", "stop"), ("a/A$8", "run()V"): row("z", "hook")}
+        self.assertEqual(probe.classify(before, patched, recompiled=True), {("a/A$8", "run()V"): "changed"})
+
     def test_against_the_same_loader_any_code_change_counts_and_lambdas_too(self):
         before = {("a/A", "m()V"): row("c1", "r1"), ("a/A", "gone()V"): row("g", "g")}
         after = {("a/A", "m()V"): row("c1x", "r1"), ("a/A", "lambda$m$0()V"): row("l", "l")}
         self.assertEqual(probe.classify(before, after, recompiled=False),
                          {("a/A", "m()V"): "changed", ("a/A", "lambda$m$0()V"): "added", ("a/A", "gone()V"): "removed"})
+
+
+class SettleTests(unittest.TestCase):
+    def test_a_class_no_source_patch_names_is_the_recompile_only(self):
+        status = {("net/A", "m()V"): "changed", ("net/A$1", "run()V"): "changed", ("net/B", "m()V"): "changed",
+                  ("net/B", "n()V"): "access"}
+        settled, count = probe.settle(status, {"net/A": None})
+        self.assertEqual(settled, {("net/A", "m()V"): "changed", ("net/A$1", "run()V"): "changed",
+                                   ("net/B", "m()V"): "recompile", ("net/B", "n()V"): "access"})
+        self.assertEqual(count, 1)
+
+    def test_with_the_patch_files_a_method_is_changed_exactly_where_its_lines_are_patched(self):
+        patch = ("--- a/A.java\n+++ b/A.java\n@@ -10,4 +10,5 @@\n context\n-        x < 1\n+        x <= 1\n"
+                 "+        // Neo\n context\n@@ -40,2 +41,3 @@\n context\n+@Annotation\n context\n")
+        lines = probe.patch_lines(patch)
+        self.assertEqual(lines, {10, 11, 12, 42})
+        # The same patch as NeoForge writes it, without the new side's starts: 40 + (2 added - 1 removed) = 41.
+        self.assertEqual(probe.patch_lines(patch.replace("+10,5", "+_,5").replace("+41,3", "+_,3")), lines)
+        disk = {("net/A", "near()V"): {"lines": "9-13"}, ("net/A", "far()V"): {"lines": "20-30"},
+                ("net/A", "<class>"): {"lines": ""}}
+        # near() moved only by the recompile, by its references, but the patch changed a comparison in it.
+        status = {("net/A", "near()V"): "recompile", ("net/A", "far()V"): "changed"}
+        settled, count = probe.settle(status, {"net/A": lines}, disk)
+        self.assertEqual(settled, {("net/A", "near()V"): "changed", ("net/A", "far()V"): "recompile",
+                                   ("net/A", "<class>"): "changed"})
+        self.assertEqual(count, 2)
 
 
 class AttributeTests(unittest.TestCase):
@@ -53,6 +86,10 @@ class AttributeTests(unittest.TestCase):
         self.assertEqual(who(("net/Z", "f()V"), "?a.AMixin,?b.BMixin"), {"one of: a.jar, b.jar"})
         self.assertEqual(who(("net/Z", "create(Ljava/lang/String;)V"), ""), {"(the loader, on a method it added)"})
         self.assertEqual(who(("net/Z", "f()V"), ""), {"(unattributed)"})
+        # An interface a mod's jar holds names that mod; the loader's own interfaces are no evidence.
+        classes["fab.api.FabricFlag"] = "fabric-api.jar"
+        self.assertEqual(who(("net/Z", "<class>"), "@fab.api.FabricFlag,@neo.IExtension"), {"fabric-api.jar"})
+        self.assertEqual(who(("net/Z", "<class>"), "@neo.IExtension,?b.BMixin"), {"b.jar"})
 
 
 class ProfileTests(unittest.TestCase):

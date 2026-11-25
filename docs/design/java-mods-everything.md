@@ -110,50 +110,87 @@
 3. **P3 วาดภาพ:** หน้า title ของ Java client จริงวาดผ่าน backend wgpu
 4. **P4 accelerator ตัวแรก:** ระบบไฟ เปิดเมื่อแผนบอกว่าปลอดภัย และผ่าน parity harness เดิม
 
-## ผล P1 (2026-11-25)
+## ## ผล P1 (2026-11-25)
 
-รัน `python tools/loader_probe.py` กับโปรไฟล์ "Fabric 26.3" (Fabric Loader 0.19.5) และม็อด 22 ตัวในเครื่องของผู้พัฒนา ได้แก่ Fabric API, Sodium, Iris, C2ME, ViaFabricPlus, Litematica ฯลฯ ใช้เวลาโหลด 11 วินาที และเทียบ 3 วินาที
+ตัวทดลอง: `python tools/loader_probe.py` (Agent อยู่ที่ `mods/horizon/src/loader-probe/`) รัน loader จริงสองรอบ คือไม่ลงม็อดกับลงม็อด แล้วทำรายงาน 3 ส่วน
 
-- **คลาส vanilla 11,383 ตัว โหลดผ่าน loader ได้ครบ** ไม่ล้มเลยสักตัว
-- **ไม่ถูกแตะเลย 10,389 คลาส (91%)** ส่วน 994 คลาสถูกแก้ method ไป 1,604 ตัว (อีก 757 ตัวเปลี่ยนแค่สิทธิ์การเข้าถึง เพราะ access widener)
-- **ตัวที่แก้เยอะสุด:** Fabric API 551 ตัว ซึ่งเป็น patch ของ loader ที่รู้จัก (`RUST_WITH_MOMENTS`), ViaFabricPlus 434, C2ME 177 และ Iris 145
-- **ระบบไฟถูกแตะแค่ 3 method และ redstone ไม่ถูกแตะเลย:** จึงเป็นตัวเริ่มที่ดีสำหรับ accelerator ส่วน worldgen ถูก C2ME แตะ 74 ตัว ซึ่งเป็นม็อดเร่งความเร็วที่ Horizon มาแทนอยู่แล้ว
-- **ระบุที่มาได้ครบทุก method แล้ว** (รอบที่สอง): ตัวทดลองอ่าน mixin config ในม็อดเองโดยตรง เจอ mixin 2,238 คลาสที่เล็งคลาส vanilla 932 ตัว ส่วน `<init>`/`<clinit>` ที่ mixin ใส่ค่าเริ่มต้นให้ field ก็ระบุได้จาก field ที่ mixin ประกาศ และการเปลี่ยนสิทธิ์การเข้าถึง 757 ตัวระบุได้จากไฟล์ access widener ของแต่ละม็อด (Fabric API 677, Sodium 291 ฯลฯ)
-- **ข้อ D ได้หลักฐานแล้ว:** ใน jar ของ 26.3 ระบบวาดภาพแยกเป็น API กลาง (`com/mojang/renderpearl/api`: `GpuBackend`, `GpuDevice`, `CommandEncoder`) และมี backend สองตัวคือ `backend/opengl` กับ `backend/vulkan` backend ตัวที่สามที่ทำด้วย wgpu จึงมีที่เสียบรออยู่แล้ว
+1. **jar ของ loader เทียบกับ vanilla:** สิ่งที่ loader แก้ไว้ตอนติดตั้ง
+2. **สิ่งที่ loader แก้ตอนโหลด:** mixin, access transformer และ coremod ของ loader เอง เทียบกับ jar บนดิสก์ (ตัวทดลองอ่านคลาสจาก code source ของแต่ละคลาส)
+3. **สิ่งที่ม็อดแก้เพิ่ม:** เทียบกับ loader ตัวเดียวกันที่ไม่ลงม็อด
 
-### NeoForge 26.3.0.118 (ม็อด 13 ตัว: Sodium, Lithium, FerriteCore, ImmediatelyFast, Entity Culling, AE2, GuideME, JEI, Mezz Config, AppleSkin, Xaero's Minimap, Architectury, Cloth Config)
+| Loader | ม็อด | คลาสที่โหลดได้ | ม็อดแก้ code | ม็อดแก้สิทธิ์ | ระบุที่มาไม่ได้ |
+|---|---:|---:|---:|---:|---:|
+| Fabric 26.3 (Loader 0.19.5) | 22 | 11,383 / 11,383 | 2,085 | 902 | 0 |
+| NeoForge 26.3.0.118 | 13 | 11,383 / 11,383 | 779 | 106 | 0 |
+| Forge 26.3-66.1.9 | 11 | 11,383 / 11,383 | 171 | 462 | 0 |
+| Quilt 0.20.0-beta.9 | – | บูตไม่ได้ (ดูด้านล่าง) | – | – | – |
 
-- **ข้อค้นพบสำคัญ:** NeoForge สร้าง jar ของเกมใหม่ด้วยการ decompile แล้ว compile กลับ (`minecraft-client-patched`) bytecode เลยต่างจาก vanilla ถึง 86,812 method ทั้งที่ NeoForge แก้จริงแค่บางส่วน เช่น `ARGB.computeSrgbToLinear` ที่ NeoForge ไม่ได้แตะเลยก็ยังต่าง
-  - **ผลต่อการออกแบบ:** baseline สำหรับม็อดต้องเป็น **loader ตัวเดียวกันที่ไม่ลงม็อด** ไม่ใช่ vanilla (ตัวทดลองรันสองรอบอัตโนมัติแล้ว)
-  - **การแก้ของ NeoForge เองหาได้จาก "สิ่งที่ method อ้างถึง":** เทียบเซตของการเรียก method, field, type และ string ที่ method ใช้ แทนการเทียบคำสั่งตรง ๆ การ compile ใหม่จะย้าย branch แต่ไม่เปลี่ยนสิ่งที่อ้างถึง ส่วน patch จะเปลี่ยน
-    - **สิ่งที่ตัดทิ้งเพราะเป็นเศษจากการ compile ใหม่:** `Objects.requireNonNull` ที่ javac ใส่ให้เอง, `MatchException` ของ pattern switch, ตัวเลขคงที่ (ถูกพับรวมต่างกัน), จำนวนครั้งที่อ้างถึง (เปลี่ยนตาม `finally` ที่ถูกคัดลอก) และเลขของ lambda, anonymous class (`Outer$3`) และ `access$NNN`
-    - **lambda กับ method reference นับเป็นสิ่งที่มันเรียก:** `font::width` กับ `s -> this.font.width(s)` จึงเท่ากัน
-    - **ผล:** method ที่ต่าง 86,812 ตัว ลดเหลือที่แก้จริง 1,799 ตัว (อีก 71,665 เป็นแค่ compile ใหม่)
-  - **ตรวจกับ source patch จริงของ NeoForge (850 ไฟล์ จาก branch `26.3.x`) ด้วย `--loader-patches`:** ตัวทดลองเจอ **97.2%** ของคลาสที่มี patch ส่วนที่ตัวทดลองเจอแต่ไม่มีไฟล์ patch มี 217 คลาสที่เปลี่ยนแค่สิทธิ์การเข้าถึง (มาจาก access transformer ของ NeoForge เอง ไม่ได้อยู่ใน patch) และเศษจากการ compile ใหม่ **72 method (4%)** เศษที่เหลือต่างกันไปทุกตัว เช่น overload ที่เลือกต่างกัน (`writeByte(I)` กับ `writeByte(B)`), cast ที่เพิ่มเข้ามา และค่าที่ถูกแทนลงไปตรง ๆ (`val$range` กับ `Interval.INFINITE`) เศษพวกนี้อยู่ฝั่งปลอดภัย คือทำให้ Java รันเกินจำเป็น แต่ไม่ทำให้ม็อดพัง
-- **ม็อดแก้เพิ่มจาก NeoForge 610 method ระบุที่มาได้ครบทุกตัว** (แยกการเปลี่ยนสิทธิ์อีก 48 ตัวออกแล้ว) Lithium มากที่สุด ตามด้วย Sodium, ImmediatelyFast, Xaero, Architectury และ AE2 ตัวสุดท้ายที่เคยระบุไม่ได้คือ `Raider.<clinit>` ซึ่งเป็นของ Lithium ระบุได้เพราะ mixin ทุกตัวบนคลาสนั้นมาจากม็อดเดียว
-- **ระบบไฟและ network ไม่ถูกม็อดแตะเลย** redstone ถูกแตะแค่ 4 (Lithium) ส่วนม็อดเนื้อหาใหญ่อย่าง AE2 แตะ method vanilla แค่ 15 ตัว
-- **ตัดออกจากชุด:** Iris NeoForge 26.3 (1.11.7) ใช้ร่วมกับ Sodium รุ่นไหนก็ไม่ได้ จึงเอาออก และใช้ Sodium 0.9.3 แทน 0.9.4-beta.2
+ตัวเลข "แก้ code" รวมแถว `<class>` ด้วย คือ supertype, interface, field และ annotation ของคลาส ซึ่ง mixin เปลี่ยนได้โดยไม่ต้องแตะ method ใดเลย
 
-### Forge 26.3-66.1.9 (ม็อด 11 ตัว: Biomes O' Plenty, GlitchCore, TerraBlender, GeckoLib, Xaero's Minimap, Xaero's World Map, Collective, Mouse Tweaks, Sound Physics Remastered, Iceberg, Forge Config API Port)
+### ระบบที่ว่างให้ Rust เร่งได้ (ม็อดไม่แตะ)
 
-- **บูตผ่าน ไม่ล้มเลยสักคลาส** Forge ใช้ `net.minecraftforge.bootstrap.ForgeBootstrap` และแก้เกมด้วย binary patch ทีละคลาส คลาสที่แก้ถูก compile ใหม่ด้วย (มี 16,611 method ที่เป็นแค่ compile ใหม่)
-- **Forge แก้เกมเอง 1,201 method** ส่วนใหญ่อยู่ใน entity และ block ระบบไฟถูกแตะ 1 ตัว และ redstone ไม่ถูกแตะ
-- **ม็อดแก้เพิ่มจาก Forge 133 method ระบุที่มาได้ครบ**
-  - 7 ตัวที่เคยระบุไม่ได้คือ `create(...)` ของ enum ที่ Forge เพิ่มเอง (`MobCategory`, `PathType`, `RecipeBookType` ฯลฯ) ซึ่งระบบขยาย enum ของ Forge เติมให้ จึงนับเป็นของ loader
-  - ตัวทดลองอ่าน coremod ของ Forge (`META-INF/coremods.json`) ด้วย ในแพ็กนี้ Xaero's Minimap มี coremod ที่แก้ `ToggleKeyMapping`
-  - การเปลี่ยนสิทธิ์ 425 ตัวระบุได้ครบ (access transformer แบบ wildcard `*()` นับเป็นทั้งคลาส)
-  - ระบบไฟ, redstone และ network ไม่ถูกม็อดแตะเลย
-- **ม็อด worldgen ขนาดใหญ่อย่าง Biomes O' Plenty แทบไม่แตะ method ของเกม** ตัวที่แตะ worldgen คือ TerraBlender (10)
+| ระบบ | Fabric | NeoForge | Forge |
+|---|---|---|---|
+| ระบบไฟ | 3 (Sodium Extra, C2ME) | **0** | **0** |
+| redstone | **0** | 2 (Lithium) | **0** |
+| network | 44 (Fabric API, ViaFabricPlus) | 1 (Xaero) | 5 (Iceberg, GeckoLib, Xaero) |
+| worldgen | 145 (C2ME 118) | 12 (Lithium, Sodium, AE2) | 17 (TerraBlender 15) |
 
-### Quilt Loader 0.20.0-beta.9
+ม็อดที่แตะระบบหนักส่วนใหญ่เป็นม็อดเร่งความเร็ว (C2ME, Lithium, Sodium) ซึ่ง Horizon จะทำแทนอยู่แล้ว ส่วนม็อดเนื้อหาอย่าง AE2 และ Biomes O' Plenty แทบไม่แตะ method ของเกม
 
-- **บูต 26.3 ไม่ได้ เป็นข้อจำกัดของ Quilt เอง ไม่ใช่ของตัวทดลอง:** Quilt ใช้ ASM 9.5 ซึ่งอ่านคลาสของ Java 25 (major version 69) ไม่ได้ จึงล้มตั้งแต่ `GameTransformer.locateEntrypoints` ก่อนโหลดม็อดใด ๆ และ QSL ก็ยังไม่มีรุ่นสำหรับ 26.3
-- **ผลต่อการออกแบบ:** ตอนนี้ผู้เล่น 26.3 ใช้ Quilt ไม่ได้ ไม่ว่าจะเป็นเกมจริงหรือ Horizon พอ Quilt ออกรุ่นที่รองรับแล้ว ให้รันตัวทดลองซ้ำด้วยคำสั่งเดิม
+### วิธีระบุที่มา เรียงจากแน่นอนที่สุด
 
-**วิธีระบุที่มา เรียงจากแน่นอนที่สุด:** mixin ที่ merge เข้า method หรือที่ method ใช้ member ของมัน → access widener หรือ access transformer ของม็อด → coremod ของม็อด → mixin ทุกตัวบนคลาสมาจากม็อดเดียว → method ที่ loader เพิ่มเอง ถ้าไม่เข้าข้อไหนเลยจะขึ้นว่า "ระบุไม่ได้" ซึ่งในสามแพ็กตอนนี้เหลือ 0
+1. mixin ที่ merge เข้า method (`@MixinMerged`) หรือ method ใช้ member ที่ mixin ประกาศ (ใช้ระบุค่าเริ่มต้นของ field ใน `<init>`/`<clinit>`)
+2. สำหรับแถว `<class>`: mixin ที่ประกาศ field หรือเพิ่ม interface, accessor mixin (ตัว mixin เองกลายเป็น interface ของคลาส) และ interface ที่ม็อดฉีดเข้าไป (เช่น `FabricTooltipFlag` ของ Fabric API) ส่วน interface ของ loader เอง (เช่น `IKeyMappingExtension` ของ NeoForge) ไม่นับเป็นหลักฐาน
+3. access widener (Fabric, Quilt) หรือ access transformer (Forge, NeoForge) ของม็อด ส่วน `*` และ `*()` นับเป็นทั้งคลาส และ Mixin เองก็ขยายสิทธิ์ได้ตามที่ mixin ประกาศ
+4. coremod ของม็อด (`META-INF/coremods.json` → JavaScript) ในแพ็ก Forge นี้ Xaero's Minimap มี coremod ที่แก้ `ToggleKeyMapping`
+5. mixin ทุกตัวบนคลาสมาจากม็อดเดียว (เช่น `Raider.<clinit>` ของ Lithium)
+6. method ที่ loader เพิ่มเอง (เช่น `create(...)` ของ enum ที่ระบบขยาย enum ของ Forge เติมให้)
 
-**สรุปสี่ตัว:** การเทียบกับ loader ที่ไม่ลงม็อดได้ผลทั้ง Fabric, NeoForge และ Forge จึงใช้เป็นวิธีหลักได้ ส่วน Quilt ยังรองรับ 26.3 ไม่ได้ ระบบไฟและ redstone ว่างให้ Rust เร่งได้ในทั้งสามแพ็ก ส่วนที่ถูกแตะมักเป็นม็อดเร่งความเร็ว (Lithium, C2ME, Sodium) ซึ่งเป็นงานที่ Horizon จะทำแทนอยู่แล้ว
+mixin อ่านจากไฟล์ mixin config และ `@Mixin` ในตัว jar ของม็อดเอง รวมถึง jar ที่ซ้อนอยู่ข้างใน (`META-INF/jars`, jarjar) จึงใช้ได้ทุก loader เพราะทุกตัวใช้ SpongePowered Mixin
 
-## เอาอะไรจาก forge/ari มาใช้
+### NeoForge: jar ถูก compile ใหม่ทั้งตัว
+
+- **jar ของเกมที่ NeoForge สร้าง (`minecraft-client-patched`) คือ vanilla ที่ decompile แล้ว compile กลับ บวก source patch** bytecode จึงต่างจาก vanilla ถึง 86,812 method ทั้งที่ NeoForge แก้จริงไม่ถึง 3,000 ตัว
+- **เทียบด้วย "สิ่งที่ method อ้างถึง":** ใช้เซตของการเรียก method, field, type และ string ที่ method ใช้ โดยพับ lambda ที่มันสร้างเข้ามารวมด้วย และตัดสิ่งที่การ compile ใหม่เปลี่ยนเองทิ้ง ได้แก่ `Objects.requireNonNull`, `MatchException`, ตัวเลขคงที่, ค่าที่จับมาใน anonymous class (`val$x`, `this$0`) และเลขของ lambda, anonymous class, `access$NNN` ส่วน anonymous class ที่ถูกเรียงเลขใหม่จับคู่กันด้วยรูปร่างของคลาสแทนเลข
+- **ตัดสินระดับ method ด้วย source patch ของ NeoForge (`--loader-patches <folder>`):** jar ถูก compile พร้อมเลขบรรทัด เลยจับคู่บรรทัดที่ patch แก้กับช่วงบรรทัดของแต่ละ method (รวม lambda ที่มันสร้าง) ได้ตรงตัว
+  - patch ที่แก้แค่ค่าคงที่หรือเครื่องหมายเปรียบเทียบก็นับ เช่น `PathNavigation` ที่แก้ MC-94054 (`<` เป็น `<=`) ซึ่งการเทียบสิ่งที่อ้างถึงอย่างเดียวมองไม่เห็น
+  - patch ที่แก้นอก method (annotation, field, generic signature) นับเป็นแถว `<class>`
+  - รูปแบบ patch ของ NeoForge ไม่ใส่เลขบรรทัดฝั่งใหม่ (`@@ -250,11 +_,14 @@`) ตัวทดลองคำนวณจากผลต่างสะสมของ hunk ก่อนหน้า
+- **ผล (patch ของ commit `84d0790633` บน branch `26.3.x` ซึ่งตรงกับ 26.3.0.118 พอดี เพราะอยู่ห่างจาก tag `26.3.0` 118 commit):**
+  - เจอการแก้ใน **850/850 (100%)** ของคลาสที่มี patch
+  - ไม่มีคลาสที่ไม่มี patch แต่มี method เพิ่มหรือหาย
+  - ที่เจอเพิ่มโดยไม่มีไฟล์ patch คือ 228 คลาสที่เปลี่ยนแค่สิทธิ์ ซึ่งมาจาก access transformer ที่ตัวติดตั้งของ NeoForge ใส่ลงใน jar (เป็นการแก้จริงของ loader)
+  - ตอนโหลด NeoForge แก้เพิ่มอีก 65 method และเปลี่ยนสิทธิ์ 82 ตัว
+- **ถ้าไม่มีไฟล์ patch:** ตัวทดลองยังตัดสินด้วยสิ่งที่อ้างถึงได้ แต่จะเหลือเศษจากการ compile ใหม่ราว 4% ซึ่งอยู่ฝั่งปลอดภัย (ทำให้ Java รันเกินจำเป็น ไม่ทำให้ม็อดพัง)
+- **ตัดออกจากชุดทดสอบ:** Iris NeoForge 26.3 (1.11.7) ใช้ร่วมกับ Sodium รุ่นไหนก็ไม่ได้ จึงเอาออก และใช้ Sodium 0.9.3 แทน 0.9.4-beta.2
+
+### Forge
+
+- **บูตด้วย `net.minecraftforge.bootstrap.ForgeBootstrap`:** jar ของ Forge (`forge-26.3-66.1.9-client.jar`) เก็บคลาสของเกมทั้งชุด คลาสที่ patch ถูก compile ใหม่ (16,004 method เป็นแค่ compile ใหม่) และ Forge แก้เอง 1,624 method ในไฟล์ jar กับอีก 58 method ตอนโหลด
+- **ม็อดแก้เพิ่ม 171 ระบุที่มาได้ครบ** ระบบไฟและ redstone ไม่ถูกแตะ
+
+### Quilt Loader 0.20.0-beta.9 (ปล่อยไว้ รอ Quilt ออกรุ่นใหม่)
+
+- **บูต 26.3 ไม่ได้ เป็นข้อจำกัดของ Quilt เอง ไม่ใช่ของตัวทดลอง:** Quilt ใช้ ASM 9.5 ซึ่งอ่านคลาสของ Java 25 (major version 69) ไม่ได้ จึงล้มใน `GameTransformer.locateEntrypoints` ก่อนโหลดม็อดใด ๆ และ QSL ก็ยังไม่มีรุ่นสำหรับ 26.3
+- **พอ Quilt ออกรุ่นที่รองรับ 26.3 แล้ว ให้รันคำสั่งเดิมซ้ำ** ตัวทดลองไม่ต้องแก้
+
+### ข้อ D (การวาดภาพ) ได้หลักฐานแล้ว
+
+ใน jar ของ 26.3 ระบบวาดภาพแยกเป็น API กลาง (`com/mojang/renderpearl/api`: `GpuBackend`, `GpuDevice`, `CommandEncoder`) และมี backend สองตัวคือ `backend/opengl` กับ `backend/vulkan` backend ตัวที่สามที่ทำด้วย wgpu จึงมีที่เสียบรออยู่แล้ว
+
+### ทำซ้ำ
+
+```sh
+python tools/loader_probe.py                                   # Fabric: โปรไฟล์และม็อดใน launcher
+python tools/loader_probe.py --minecraft DIR --profile neoforge-26.3.0.118 --mods MODS --loader-patches PATCHES
+python tools/loader_probe.py --minecraft DIR --profile 26.3-forge-66.1.9 --mods MODS
+python tools/loader_probe.py --report-only                     # ทำรายงานใหม่จากรอบล่าสุด
+python -m unittest tests.test_loader_probe                     # 8 เทสต์
+```
+
+ทุกรอบรันในโฟลเดอร์ชั่วคราวใต้ `.local/loader-probe/` (git ไม่เก็บ) ไม่อ่านและไม่เขียนเซฟ, การตั้งค่า หรือ config ของผู้เล่น
+
+เอาอะไรจาก forge/ari มาใช้
 
 host JNI (`horizon-java-host`), views, bridges, routes (`routes.rs`: Edge/Body), การ export facts และ cache เนื้อหา, harness ที่เทียบกับ loader จริง สิ่งที่เปลี่ยนคือฝั่งที่เป็นหลัก (Java) และจุดที่เข้าไปแทรก (agent แทน `ClassProcessor`)
