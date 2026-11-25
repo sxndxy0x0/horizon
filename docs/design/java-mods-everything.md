@@ -105,12 +105,12 @@
 
 ## ลำดับพิสูจน์ (ของเล็กก่อน)
 
-1. **P1 Agent + diff ของ bytecode:** บูต Fabric 26.3 และ NeoForge 26.3 จริงพร้อมม็อดตัวอย่างใน JVM ธรรมดา แล้วให้ agent ออกรายงานว่าม็อดแตะ method ไหน ยังไม่ต้องใช้ Horizon เครื่องนี้มี Fabric 26.3 อยู่แล้ว
-2. **P2 หน่วยความจำร่วม:** `PalettedContainer` ของ Java บนหน่วยความจำของ Rust เซฟแล้วได้ผลตรงกับ vanilla ทุก byte
+1. ✅ **P1 Agent + diff ของ bytecode:** บูต Fabric 26.3 และ NeoForge 26.3 จริงพร้อมม็อดตัวอย่างใน JVM ธรรมดา แล้วให้ agent ออกรายงานว่าม็อดแตะ method ไหน ยังไม่ต้องใช้ Horizon เครื่องนี้มี Fabric 26.3 อยู่แล้ว
+2. ✅ **P2 หน่วยความจำร่วม:** `PalettedContainer` ของ Java บนหน่วยความจำของ Rust เซฟแล้วได้ผลตรงกับ vanilla ทุก byte
 3. **P3 วาดภาพ:** หน้า title ของ Java client จริงวาดผ่าน backend wgpu
 4. **P4 accelerator ตัวแรก:** ระบบไฟ เปิดเมื่อแผนบอกว่าปลอดภัย และผ่าน parity harness เดิม
 
-## ## ผล P1 (2026-11-25)
+## ผล P1 (2026-11-25)
 
 ตัวทดลอง: `python tools/loader_probe.py` (Agent อยู่ที่ `mods/horizon/src/loader-probe/`) รัน loader จริงสองรอบ คือไม่ลงม็อดกับลงม็อด แล้วทำรายงาน 3 ส่วน
 
@@ -191,6 +191,50 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
 
 ทุกรอบรันในโฟลเดอร์ชั่วคราวใต้ `.local/loader-probe/` (git ไม่เก็บ) ไม่อ่านและไม่เขียนเซฟ, การตั้งค่า หรือ config ของผู้เล่น
 
-เอาอะไรจาก forge/ari มาใช้
+## ผล P2 (2026-11-25): โค้ด vanilla ทำงานบนหน่วยความจำของ Rust
+
+ตัวทดลอง: `python tools/shared_memory_probe.py`
+
+- **ฝั่ง Rust:** crate `crates/horizon-shm-probe` (cdylib) จองหน่วยความจำของ storage และอ่านเขียนด้วยโค้ดของ `horizon-core` เอง (`PackedStorage`, `PalettedContainer`)
+- **ฝั่ง Java:** `mods/horizon/src/shared-memory-probe/` ประกอบด้วย
+  - `RustBitStorage` คือ `SimpleBitStorage` ที่ทุกการอ่านเขียนไปลงหน่วยความจำของ Rust ตรง ๆ ผ่าน FFM (`java.lang.foreign`) ไม่มีการคัดลอก
+  - Agent เปลี่ยนทุก `new SimpleBitStorage(...)` ในโค้ดเกมเป็น `RustBitStorage.create(...)` (ทำงานบน bytecode จึงใช้ได้ทุก loader)
+
+### วิธีทดสอบ
+
+รันงานชุดเดียวกันสองรอบ รอบแรกบน storage ของ vanilla รอบสองบน storage ของ Rust แล้วเทียบผล
+
+- **96 section:** แต่ละ section มีจำนวนสถานะบล็อกต่างกัน (1 ถึง 5,000) ครอบคลุม palette ทุกแบบ ได้แก่ single, linear, hash map และ global แต่ละ section ทำ `getAndSet` 9,000 ครั้ง
+- **สิ่งที่เทียบ:** ค่าทุก cell, byte ที่ส่งผ่าน network, การอ่านกลับจาก network, `copy()`, ข้อมูลตอนเซฟ (codec ของ `PalettedContainer`) และลำดับค่าที่ `getAndSet` คืน
+
+### ผล
+
+- **ตรงกันทั้ง 96/96 section ทุกตัวที่เทียบ**
+- **Rust อ่านหน่วยความจำเดียวกันด้วย `horizon-core` ตรวจ 352 ครั้ง ผิด 0 ครั้ง:**
+  - ค่าทุกตัวใน storage ตรงกัน
+  - `PalettedContainer` ของ `horizon-core` ที่สร้างจาก word เดียวกันกับ palette เดียวกัน อ่านทุก cell ได้ตรง
+  - Rust เขียน cell ลงไปแล้ว Java อ่านเห็นทันที
+- **`RustBitStorage` เทียบกับ `SimpleBitStorage` ทีละคำสั่ง:** bit 1–32 × ขนาด 1, 37, 64, 4096 รวม 128 กรณี ได้ long ตรงกันทุก bit รวมถึง padding ที่ `fill` ใส่ไว้
+- **ความเร็ว** (เครื่องของผู้พัฒนา ns ต่อการทำงานหนึ่งครั้ง 3 รอบ):
+
+| | vanilla | Rust |
+|---|---:|---:|
+| storage ตรง ๆ (`getAndSet` + `get`) | 9.0 / 11.8 / 9.2 | 9.7 / 11.5 / 11.2 |
+| ผ่าน `PalettedContainer` | 104 / 94 / 99 | 114 / 114 / 120 |
+
+  storage เท่ากันในระดับ noise ระหว่างรอบ (ใช้ VarHandle ของ array view และการหารแบบคูณ-shift แบบเดียวกับ vanilla) ส่วนผ่าน container ช้ากว่า 10–20% ยังต้องหาสาเหตุ
+
+### สิ่งที่เจอระหว่างทาง
+
+- **โค้ด vanilla เขียนลงใน array ที่ `getRaw()` คืนมาโดยตรง:** `PalettedContainer.read` (อ่าน section จาก network) และ `Heightmap.setRawData` เพราะ array บน heap ชี้หน่วยความจำนอก heap ไม่ได้ Agent จึงเปลี่ยนทุก `getRaw()` เป็น `RustBitStorage.raw(...)` ซึ่งให้สำเนาไป และตอนจบ method ที่เรียกมันจะเขียนส่วนที่ถูกแก้กลับลงหน่วยความจำของ Rust (`flush`)
+- **ในทั้ง jar มี 7 จุดที่เรียก `getRaw()` ของ storage:** ข้อสรุปนี้จึงมาจากการตรวจทุกจุด ไม่ใช่การเดา
+
+### ที่ยังไม่ได้พิสูจน์ใน P2
+
+- **ยังไม่ได้ลองใน Horizon จริง:** ตอนนี้ Rust เป็นเจ้าของหน่วยความจำ แต่ยังไม่ได้ให้ `World` ของ Horizon ใช้หน่วยความจำนั้นเป็นที่เก็บ chunk จริง อีกทั้ง `PackedStorage` ของ `horizon-core` ยังถือ `Vec` ของตัวเอง ต้องมีรุ่นที่ยืม word ได้ (ตอนนี้ฝั่ง Rust อ่านผ่านสำเนา ส่วนฝั่ง Java ไม่มีการคัดลอก)
+- **ยังไม่ได้ทำ:** ระบบไฟ (`DataLayer`), heightmap ในโลกจริง และการทำงานหลาย thread
+- **ยังไม่ได้ตรวจ:** `cargo fmt` และ `clippy` เพราะเครื่องนี้ไม่ได้ติดตั้ง rustfmt/clippy แต่ `cargo test -p horizon-shm-probe` ผ่าน
+
+## เอาอะไรจาก forge/ari มาใช้
 
 host JNI (`horizon-java-host`), views, bridges, routes (`routes.rs`: Edge/Body), การ export facts และ cache เนื้อหา, harness ที่เทียบกับ loader จริง สิ่งที่เปลี่ยนคือฝั่งที่เป็นหลัก (Java) และจุดที่เข้าไปแทรก (agent แทน `ClassProcessor`)

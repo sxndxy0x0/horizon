@@ -2779,6 +2779,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-shm-probe"
+version = "0.1.0"
+dependencies = [
+ "horizon-core",
+]
+
+[[package]]
 name = "horizon-system"
 version = "0.1.0"
 
