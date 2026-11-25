@@ -11,10 +11,16 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-naga = { version = "30.0.1", features = ["spv-in"] }
+naga = { version = "30.0.1", features = ["spv-in", "wgsl-in", "wgsl-out"] }
 pollster = "0.4"
 raw-window-handle = "0.6"
 wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "dx12", "naga-ir", "wgsl"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+wgpu = { version = "30.0.1", default-features = false, features = ["gles"] }
 
 [lints]
 workspace = true

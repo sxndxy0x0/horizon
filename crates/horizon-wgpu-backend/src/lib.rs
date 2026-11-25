@@ -56,6 +56,23 @@ pub struct Ctx {
     blit_layout: Option<wgpu::BindGroupLayout>,
     clears: HashMap<(TextureFormat, Option<TextureFormat>), wgpu::RenderPipeline>,
     clear_layout: Option<wgpu::BindGroupLayout>,
+    area_clears: HashMap<AreaClearKey, wgpu::RenderPipeline>,
+    /// A triangle fan's triangles as a list, `[0, k + 1, k + 2]` for each `k`, and how many fan vertices it covers:
+    /// wgpu has no fans (see [`hz_pass_draw`]).
+    fan: Option<(wgpu::Buffer, u32)>,
+    /// Upload memory for writes in command order, reused once the GPU has copied out of it.
+    belt: wgpu::util::StagingBelt,
+    /// Bind groups made before, by layout and what is bound, with the submit that last used each: the game binds
+    /// the same few resources draw after draw. Ones unused for a few submits go (they hold their resources).
+    groups: HashMap<GroupKey, (wgpu::BindGroup, u64)>,
+    /// Timestamp pools written since the last submit: their new timestamps are resolved into it.
+    timestamps: Vec<Rc<RefCell<Timestamps>>>,
+    /// Debugging (`HZ_WGPU_DUMP_ALL=folder`): the color textures made so far, to write out at the dump frame.
+    textures: Vec<wgpu::Texture>,
+    /// Debugging: write the dumps at the next present (set by [`hz_dump_next`]).
+    dump_next: bool,
+    /// Debugging (`HZ_WGPU_DUMP_ALL`): after a dump, each pass of the next frame writes its first color target.
+    dump_passes: Option<u32>,
     /// `HZ_WGPU_TRACE`: per-submit counts, passes and read-backs on stderr.
     trace: bool,
     passes: u32,
@@ -64,6 +81,15 @@ pub struct Ctx {
     texture_writes: u32,
     presented: u64,
 }
+
+/// An area clear's pipeline, by the pass's color formats, which of them it clears, its depth format and whether
+/// it clears depth.
+type AreaClearKey = (
+    Vec<Option<TextureFormat>>,
+    Vec<bool>,
+    Option<TextureFormat>,
+    bool,
+);
 
 pub struct Buf {
     buffer: wgpu::Buffer,
@@ -110,6 +136,8 @@ pub struct Pipeline {
     cull: bool,
     wireframe: bool,
     topology: wgpu::PrimitiveTopology,
+    /// The game's triangle fan: drawn as a triangle list through [`fan_indices`].
+    fan: bool,
     targets: Vec<Option<(Option<wgpu::BlendState>, wgpu::ColorWrites)>>,
     variants: RefCell<HashMap<VariantKey, Arc<Variant>>>,
 }
@@ -125,6 +153,9 @@ struct VariantKey {
 struct Variant {
     pipeline: wgpu::RenderPipeline,
     groups: Vec<(u32, wgpu::BindGroupLayout)>,
+    /// The (group, binding)s of the buffers bound with a dynamic offset: the game binds one buffer at a new offset
+    /// draw after draw (a section's uniforms), and one bind group then serves every offset.
+    dynamic: Vec<(u32, u32)>,
 }
 
 /// What a pass has bound at a uniform index. It holds its own references: the game may close a view, sampler
@@ -133,6 +164,20 @@ struct Variant {
 enum Bound {
     Buffer(wgpu::Buffer, u64, u64),
     Texture(Rc<View>, wgpu::Sampler, wgpu::Sampler),
+}
+
+/// A bind group's identity: its layout and, by binding, what goes there.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct GroupKey {
+    layout: wgpu::BindGroupLayout,
+    entries: Vec<(u32, GroupEntry)>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum GroupEntry {
+    Buffer(wgpu::Buffer, u64, u64),
+    View(wgpu::TextureView),
+    Sampler(wgpu::Sampler),
 }
 
 struct Pass {
@@ -145,10 +190,16 @@ struct Pass {
     dirty: bool,
     variant: Option<Arc<Variant>>,
     index_format: wgpu::IndexFormat,
+    /// The index buffer the game bound, set again after a fan draw bound its own.
+    index: Option<wgpu::Buffer>,
+    /// Debugging: the first color target, for the pass dumps.
+    first_color: Option<(wgpu::Texture, u32)>,
 }
 
 pub struct Surface {
-    surface: wgpu::Surface<'static>,
+    /// None when headless (`HZ_WGPU_HEADLESS`): frames are drawn and submitted, not shown. For comparing backends
+    /// whose window surface a driver does not offer (wgpu's Vulkan on some Windows drivers).
+    surface: Option<wgpu::Surface<'static>>,
     config: Option<wgpu::SurfaceConfiguration>,
     current: Option<wgpu::SurfaceTexture>,
     suboptimal: bool,
@@ -255,27 +306,22 @@ impl Ctx {
             self.queue.write_buffer(buffer, start, data);
             return;
         }
-        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("horizon write"),
-            size: data.len() as u64,
-            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::MAP_WRITE,
-            mapped_at_creation: true,
-        });
-        staging
-            .slice(..)
-            .get_mapped_range_mut()
-            .expect("mapped at creation")
+        self.recorded = true;
+        let device = &self.device;
+        let encoder = self
+            .encoder
+            .get_or_insert_with(|| device.create_command_encoder(&Default::default()));
+        let size = wgpu::BufferSize::new(data.len() as u64).expect("not empty");
+        self.belt
+            .write_buffer(encoder, buffer, start, size)
             .copy_from_slice(data);
-        staging.unmap();
-        self.encoder()
-            .copy_buffer_to_buffer(&staging, 0, buffer, start, data.len() as u64);
     }
 
     fn submit(&mut self) -> u64 {
         for (buffer, offset, data) in std::mem::take(&mut self.dirty) {
             self.queue.write_buffer(&buffer, offset, &data);
         }
-        if self.trace && self.serial < 400 {
+        if self.trace && (self.serial < 400 || self.serial.is_multiple_of(50)) {
             eprintln!(
                 "[horizon-wgpu] submit {}: {} passes, {} draws, {} transient writes, {} buffer writes, {} texture writes",
                 self.serial + 1,
@@ -290,8 +336,37 @@ impl Ctx {
         self.draws = 0;
         self.writes = 0;
         self.texture_writes = 0;
+        // New timestamps: each resolved (one query at a time: a resolve starts on a 256-byte boundary and reads
+        // only queries that were written) and copied where a read can map it.
+        if !self.timestamps.is_empty() {
+            let pools = std::mem::take(&mut self.timestamps);
+            let device = &self.device;
+            let encoder = self
+                .encoder
+                .get_or_insert_with(|| device.create_command_encoder(&Default::default()));
+            for pool in pools {
+                let mut pool = pool.borrow_mut();
+                for i in std::mem::take(&mut pool.pending) {
+                    let at = u64::from(i) * wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT;
+                    encoder.resolve_query_set(&pool.set, i..i + 1, &pool.resolve, at);
+                    encoder.copy_buffer_to_buffer(
+                        &pool.resolve,
+                        at,
+                        &pool.read,
+                        u64::from(i) * 8,
+                        8,
+                    );
+                    pool.written[i as usize] = self.serial + 1;
+                }
+            }
+            self.recorded = true;
+        }
+        self.belt.finish();
         let commands = self.encoder.take().map(|e| e.finish());
         self.queue.submit(commands);
+        self.belt.recall();
+        let serial = self.serial + 1;
+        self.groups.retain(|_, (_, used)| serial - *used <= 3);
         self.recorded = false;
         self.serial += 1;
         let serial = self.serial;
@@ -321,33 +396,81 @@ impl Ctx {
 // ---------------------------------------------------------------------------------------------------------------
 // Device
 
-/// A device on the best adapter: DX12 on Windows (`HZ_WGPU_BACKEND=vulkan` or `primary` to choose otherwise).
-/// Null when there is none.
+/// The graphics APIs to try, in order: Vulkan first (its rasterizer rounds as the game's own Vulkan and OpenGL
+/// backends do: the same frame to the pixel, where DX12 places pixels on exact triangle edges differently), then
+/// the platform's own. `HZ_WGPU_BACKEND` (`vulkan`, `dx12`, `metal`, `gl`) picks one.
+fn apis() -> Vec<wgpu::Backends> {
+    match std::env::var("HZ_WGPU_BACKEND").as_deref() {
+        Ok("vulkan") => vec![wgpu::Backends::VULKAN],
+        Ok("dx12") => vec![wgpu::Backends::DX12],
+        Ok("metal") => vec![wgpu::Backends::METAL],
+        Ok("gl") => vec![wgpu::Backends::GL],
+        _ => vec![
+            wgpu::Backends::VULKAN,
+            wgpu::Backends::DX12,
+            wgpu::Backends::METAL,
+            wgpu::Backends::GL,
+        ],
+    }
+}
+
+/// A device on the best adapter that can present to the window `probe` names (a window of the same kind as the
+/// game's, which the game creates only after the device): the first API in [`apis`] whose adapter takes it.
+/// With no probe window, the first adapter. Null when there is none.
+///
+/// # Safety
+/// `probe` is null or a [`window_target`] description of a live window.
 #[unsafe(no_mangle)]
-pub extern "C" fn hz_create() -> *mut Ctx {
-    let backends = match std::env::var("HZ_WGPU_BACKEND").as_deref() {
-        Ok("vulkan") => wgpu::Backends::VULKAN,
-        Ok("primary") => wgpu::Backends::PRIMARY,
-        // DX12 on Windows: wgpu's Vulkan reports Win32 window surfaces unsupported on some drivers.
-        _ if cfg!(windows) => wgpu::Backends::DX12,
-        _ => wgpu::Backends::PRIMARY,
-    };
-    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-        backends,
-        ..wgpu::InstanceDescriptor::new_without_display_handle()
-    });
-    let Ok(adapter) = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-        power_preference: wgpu::PowerPreference::HighPerformance,
-        ..Default::default()
-    })) else {
-        eprintln!("[horizon-wgpu] no adapter");
+pub unsafe extern "C" fn hz_create(probe: *const c_void) -> *mut Ctx {
+    let mut chosen = None;
+    for backends in apis() {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+        // SAFETY: as the caller promises.
+        // Headless (HZ_WGPU_HEADLESS), frames are never shown: any adapter of the API will do.
+        let headless = std::env::var_os("HZ_WGPU_HEADLESS").is_some();
+        let target = unsafe { probe.cast::<WindowTarget>().as_ref() }.filter(|_| !headless);
+        let surface = match target {
+            None => None,
+            Some(t) => match unsafe { create_surface(&instance, t) } {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    eprintln!("[horizon-wgpu] {backends:?}: no surface for the window: {e}");
+                    continue;
+                }
+            },
+        };
+        let adapter =
+            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: surface.as_ref(),
+                ..Default::default()
+            })) {
+                Ok(a) => a,
+                Err(e) => {
+                    eprintln!("[horizon-wgpu] {backends:?}: no adapter: {e}");
+                    continue;
+                }
+            };
+        drop(surface);
+        chosen = Some((instance, adapter));
+        break;
+    }
+    let Some((instance, adapter)) = chosen else {
+        eprintln!("[horizon-wgpu] no adapter can present to the window");
         return std::ptr::null_mut();
     };
     let wanted = wgpu::Features::IMMEDIATES
         | wgpu::Features::DEPTH32FLOAT_STENCIL8
         | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
         | wgpu::Features::CLEAR_TEXTURE
-        | wgpu::Features::POLYGON_MODE_LINE;
+        | wgpu::Features::POLYGON_MODE_LINE
+        | wgpu::Features::INDIRECT_FIRST_INSTANCE
+        | wgpu::Features::TIMESTAMP_QUERY
+        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+        | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
     let features = adapter.features() & wanted;
     let mut limits = adapter.limits();
     limits.max_immediate_size = limits.max_immediate_size.min(256);
@@ -373,6 +496,7 @@ pub extern "C" fn hz_create() -> *mut Ctx {
             }
         }
     }));
+    let belt = wgpu::util::StagingBelt::new(device.clone(), 4 << 20);
     Box::into_raw(Box::new(Ctx {
         instance,
         adapter,
@@ -390,6 +514,14 @@ pub extern "C" fn hz_create() -> *mut Ctx {
         blit_layout: None,
         clears: HashMap::new(),
         clear_layout: None,
+        area_clears: HashMap::new(),
+        fan: None,
+        belt,
+        groups: HashMap::new(),
+        timestamps: Vec::new(),
+        textures: Vec::new(),
+        dump_next: false,
+        dump_passes: None,
         trace: std::env::var_os("HZ_WGPU_TRACE").is_some(),
         passes: 0,
         draws: 0,
@@ -420,7 +552,7 @@ pub unsafe extern "C" fn hz_info(ctx: *mut Ctx, out: *mut u8, cap: u32) -> u32 {
         let i = ctx.adapter.get_info();
         let l = ctx.device.limits();
         let text = format!(
-            "name={}\nvendor={:#x}\ndriver={} {}\nbackend={:?}\ntype={:?}\nmax_texture={}\nmin_uniform_align={}\nmax_buffer={}\nmax_colors={}\nimmediates={}\nwireframe={}\n",
+            "name={}\nvendor={:#x}\ndriver={} {}\nbackend={:?}\ntype={:?}\nmax_texture={}\nmin_uniform_align={}\nmax_buffer={}\nmax_colors={}\nimmediates={}\nwireframe={}\nindirect={}\n",
             i.name,
             i.vendor,
             i.driver,
@@ -435,6 +567,15 @@ pub unsafe extern "C" fn hz_info(ctx: *mut Ctx, out: *mut u8, cap: u32) -> u32 {
             ctx.device
                 .features()
                 .contains(wgpu::Features::POLYGON_MODE_LINE),
+            // The game's indirect terrain picks each section's data by the draw's first instance.
+            ctx.device
+                .features()
+                .contains(wgpu::Features::INDIRECT_FIRST_INSTANCE)
+                && ctx
+                    .adapter
+                    .get_downlevel_capabilities()
+                    .flags
+                    .contains(wgpu::DownlevelFlags::INDIRECT_EXECUTION),
         );
         let n = text.len().min(cap as usize);
         // SAFETY: as the caller promises.
@@ -510,25 +651,34 @@ pub unsafe extern "C" fn hz_completed(ctx: *mut Ctx) -> u64 {
 pub unsafe extern "C" fn hz_wait(ctx: *mut Ctx, serial: u64, timeout_ns: i64) -> u32 {
     guard(ctx, 0, |ctx| {
         let timeout = (timeout_ns >= 0).then(|| Duration::from_nanos(timeout_ns as u64));
+        if serial > ctx.serial {
+            // A fence on work not submitted yet (see hz_fence): not done. Asking without waiting (the game's
+            // buffer pools do, every frame) leaves it for the frame's submit; waiting submits it now.
+            if ctx.pass.is_some() || timeout == Some(Duration::ZERO) {
+                return Ok(0);
+            }
+            ctx.submit();
+        }
         Ok(u32::from(ctx.wait(serial, timeout)))
     })
 }
 
-/// The serial of everything recorded so far: submits it if there is anything unsubmitted.
+/// The serial of everything recorded so far. Unsubmitted work is not submitted for it: the fence names the next
+/// submit (the frame's, at the latest), and waiting on it submits sooner. The game makes several fences a frame,
+/// and each submit costs.
 ///
 /// # Safety
 /// `ctx` is live.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hz_fence(ctx: *mut Ctx) -> u64 {
     guard(ctx, 0, |ctx| {
-        if ctx.pass.is_some() {
-            return Ok(ctx.serial + 1);
-        }
-        Ok(if ctx.recorded || !ctx.dirty.is_empty() {
-            ctx.submit()
-        } else {
-            ctx.serial
-        })
+        Ok(
+            if ctx.pass.is_some() || ctx.recorded || !ctx.dirty.is_empty() {
+                ctx.serial + 1
+            } else {
+                ctx.serial
+            },
+        )
     })
 }
 
@@ -770,6 +920,9 @@ pub unsafe extern "C" fn hz_texture_create(
             usage: usages,
             view_formats: &[],
         });
+        if std::env::var_os("HZ_WGPU_DUMP_ALL").is_some() && fmt == TextureFormat::Rgba8Unorm {
+            ctx.textures.push(texture.clone());
+        }
         Ok(Box::into_raw(Box::new(Tex {
             texture,
             format: fmt,
@@ -938,31 +1091,28 @@ pub unsafe extern "C" fn hz_texture_write(
             return Ok(());
         }
         let padded = row.div_ceil(256) * 256;
-        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("horizon texture write"),
-            size: u64::from(padded) * u64::from(height.max(1)),
-            usage: wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::MAP_WRITE,
-            mapped_at_creation: true,
-        });
-        {
-            let mut rows = vec![0u8; padded as usize * height.max(1) as usize];
-            for r in 0..height as usize {
-                let from = r * row as usize;
-                rows[r * padded as usize..r * padded as usize + row as usize]
-                    .copy_from_slice(&data[from..from + row as usize]);
-            }
-            staging
-                .slice(..)
-                .get_mapped_range_mut()
-                .expect("mapped at creation")
-                .copy_from_slice(&rows);
+        let mut rows = vec![0u8; padded as usize * height.max(1) as usize];
+        for r in 0..height as usize {
+            let from = r * row as usize;
+            rows[r * padded as usize..r * padded as usize + row as usize]
+                .copy_from_slice(&data[from..from + row as usize]);
         }
-        staging.unmap();
+        let (staging, at) = {
+            let size = wgpu::BufferSize::new(rows.len() as u64).expect("not empty");
+            let slice = ctx
+                .belt
+                .allocate(size, wgpu::BufferSize::new(256).expect("not zero"));
+            slice
+                .get_mapped_range_mut()
+                .expect("a staging belt slice is mapped")
+                .copy_from_slice(&rows);
+            (slice.buffer().clone(), slice.offset())
+        };
         ctx.encoder().copy_buffer_to_texture(
             wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
                 layout: wgpu::TexelCopyBufferLayout {
-                    offset: 0,
+                    offset: at,
                     bytes_per_row: Some(padded),
                     rows_per_image: Some(height),
                 },
@@ -1354,6 +1504,133 @@ pub unsafe extern "C" fn hz_clear(
     })
 }
 
+/// The clears' bind group layout: one uniform buffer, read by the fragment shader.
+fn clear_layout(ctx: &mut Ctx) -> wgpu::BindGroupLayout {
+    ctx.clear_layout
+        .get_or_insert_with(|| {
+            ctx.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("horizon clear"),
+                    entries: &[wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    }],
+                })
+        })
+        .clone()
+}
+
+/// A pipeline that clears, within the scissor, the color targets marked in `clears` (to the colors in its uniform)
+/// and the depth target if `clear_depth`, leaving the others as they are.
+fn area_clear_pipeline(
+    ctx: &mut Ctx,
+    colors: &[Option<TextureFormat>],
+    clears: &[bool],
+    depth: Option<TextureFormat>,
+    clear_depth: bool,
+) -> wgpu::RenderPipeline {
+    let key = (colors.to_vec(), clears.to_vec(), depth, clear_depth);
+    if let Some(p) = ctx.area_clears.get(&key) {
+        return p.clone();
+    }
+    let layout = clear_layout(ctx);
+    let mut fields = String::new();
+    let mut values = String::new();
+    for (i, format) in colors.iter().enumerate() {
+        let Some(format) = format else { continue };
+        let ty = match format.sample_type(None, None) {
+            Some(wgpu::TextureSampleType::Sint) => "vec4<i32>",
+            Some(wgpu::TextureSampleType::Uint) => "vec4<u32>",
+            _ => "vec4<f32>",
+        };
+        fields.push_str(&format!("@location({i}) c{i}: {ty}, "));
+        values.push_str(&format!("{ty}(c.colors[{i}]), "));
+    }
+    if depth.is_some() {
+        fields.push_str("@builtin(frag_depth) depth: f32, ");
+        values.push_str("c.depth.x, ");
+    }
+    if fields.is_empty() {
+        fields.push_str("@location(0) unused: vec4<f32>, ");
+        values.push_str("vec4<f32>(0.0), ");
+    }
+    let source = format!(
+        "struct C {{ colors: array<vec4<f32>, 8>, depth: vec4<f32> }}
+         @group(0) @binding(0) var<uniform> c: C;
+         struct O {{ {fields} }}
+         @vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {{
+             let p = array(vec2(-1.0, -1.0), vec2(3.0, -1.0), vec2(-1.0, 3.0));
+             return vec4(p[i], 0.0, 1.0);
+         }}
+         @fragment fn fs() -> O {{ return O({values}); }}"
+    );
+    let module = ctx
+        .device
+        .create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("horizon area clear"),
+            source: wgpu::ShaderSource::Wgsl(source.into()),
+        });
+    let pl = ctx
+        .device
+        .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+    let targets: Vec<Option<wgpu::ColorTargetState>> = colors
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            f.map(|format| wgpu::ColorTargetState {
+                format,
+                blend: None,
+                write_mask: if clears.get(i).copied().unwrap_or(false) {
+                    wgpu::ColorWrites::ALL
+                } else {
+                    wgpu::ColorWrites::empty()
+                },
+            })
+        })
+        .collect();
+    let pipeline = ctx
+        .device
+        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("horizon area clear"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &module,
+                entry_point: Some("vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            primitive: Default::default(),
+            depth_stencil: depth.map(|format| wgpu::DepthStencilState {
+                format,
+                depth_write_enabled: Some(clear_depth),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: Default::default(),
+                bias: Default::default(),
+            }),
+            multisample: Default::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &module,
+                entry_point: Some("fs"),
+                compilation_options: Default::default(),
+                targets: &targets,
+            }),
+            multiview_mask: None,
+            cache: None,
+        });
+    ctx.area_clears.insert(key, pipeline.clone());
+    pipeline
+}
+
 fn clear_pipeline(
     ctx: &mut Ctx,
     color: Option<TextureFormat>,
@@ -1631,9 +1908,21 @@ pub unsafe extern "C" fn hz_pipeline_create(
         };
         let texels = texel_formats(d);
         let (v, f) = on_big_stack(|| -> Result<_, String> {
-            let v = shader::parse(vs, true, &texels).map_err(|e| format!("{name} vertex: {e}"))?;
-            let f =
-                shader::parse(fs, false, &texels).map_err(|e| format!("{name} fragment: {e}"))?;
+            let overridden = |what: &str| {
+                let dir = std::env::var_os("HZ_WGPU_OVERRIDE")?;
+                let file = format!("{}.{what}.wgsl", name.replace([':', '/'], "_"));
+                std::fs::read_to_string(std::path::Path::new(&dir).join(file)).ok()
+            };
+            let v = match overridden("vs") {
+                Some(text) => shader::from_wgsl(&text),
+                None => shader::parse(vs, true, &texels),
+            }
+            .map_err(|e| format!("{name} vertex: {e}"))?;
+            let f = match overridden("fs") {
+                Some(text) => shader::from_wgsl(&text),
+                None => shader::parse(fs, false, &texels),
+            }
+            .map_err(|e| format!("{name} fragment: {e}"))?;
             let validate = |m: &naga::Module, what: &str| {
                 naga::valid::Validator::new(
                     naga::valid::ValidationFlags::all(),
@@ -1663,6 +1952,26 @@ pub unsafe extern "C" fn hz_pipeline_create(
             };
             validate(&v.module, "vertex")?;
             validate(&f.module, "fragment")?;
+            // Debugging (`HZ_WGPU_WGSL=folder`): each pipeline's shaders as wgpu gets them, as WGSL.
+            if let Some(dir) = std::env::var_os("HZ_WGPU_WGSL") {
+                for (m, what) in [(&v.module, "vs"), (&f.module, "fs")] {
+                    let info = naga::valid::Validator::new(
+                        naga::valid::ValidationFlags::all(),
+                        naga::valid::Capabilities::all(),
+                    )
+                    .validate(m);
+                    if let Ok(info) = info
+                        && let Ok(text) = naga::back::wgsl::write_string(
+                            m,
+                            &info,
+                            naga::back::wgsl::WriterFlags::empty(),
+                        )
+                    {
+                        let file = format!("{}.{what}.wgsl", name.replace([':', '/'], "_"));
+                        let _ = std::fs::write(std::path::Path::new(&dir).join(file), text);
+                    }
+                }
+            }
             Ok((v, f))
         })?;
         let mut resources = v.resources.clone();
@@ -1693,7 +2002,8 @@ pub unsafe extern "C" fn hz_pipeline_create(
         let compare = compare_op(next());
         let depth_write = next() != 0;
         let cull = next() != 0;
-        let topology = match next() {
+        let topology_ordinal = next();
+        let topology = match topology_ordinal {
             1 => wgpu::PrimitiveTopology::LineList,
             2 => wgpu::PrimitiveTopology::LineStrip,
             3 => wgpu::PrimitiveTopology::PointList,
@@ -1766,6 +2076,7 @@ pub unsafe extern "C" fn hz_pipeline_create(
             cull,
             wireframe,
             topology,
+            fan: topology_ordinal == 6,
             targets,
             variants: RefCell::new(HashMap::new()),
         }))))
@@ -1872,18 +2183,42 @@ impl Pipeline {
             return v.clone();
         }
         let mut groups: Vec<(u32, Vec<wgpu::BindGroupLayoutEntry>)> = Vec::new();
+        // As many buffers as the device allows take dynamic offsets, uniforms and storage buffers apart.
+        let limits = device.limits();
+        let mut sorted = self.resources.clone();
+        sorted.sort_by_key(|r| (r.0, r.1));
+        let (mut uniforms, mut storage) = (0, 0);
+        let mut dynamic = Vec::new();
+        for &(group, binding, kind) in &sorted {
+            let (count, max) = match kind {
+                Resource::Uniform => (
+                    &mut uniforms,
+                    limits.max_dynamic_uniform_buffers_per_pipeline_layout,
+                ),
+                Resource::Storage => (
+                    &mut storage,
+                    limits.max_dynamic_storage_buffers_per_pipeline_layout,
+                ),
+                _ => continue,
+            };
+            if *count < max {
+                *count += 1;
+                dynamic.push((group, binding));
+            }
+        }
         for &(group, binding, kind) in &self.resources {
             let index = binding % spirv::SAMPLER_BINDING_OFFSET;
+            let has_dynamic_offset = dynamic.contains(&(group, binding));
             let filterable = !key.unfilterable.contains(&index);
             let ty = match kind {
                 Resource::Uniform => wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
+                    has_dynamic_offset,
                     min_binding_size: None,
                 },
                 Resource::Storage => wgpu::BindingType::Buffer {
                     ty: wgpu::BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
+                    has_dynamic_offset,
                     min_binding_size: None,
                 },
                 Resource::Texture {
@@ -2016,6 +2351,7 @@ impl Pipeline {
         let v = Arc::new(Variant {
             pipeline,
             groups: layouts,
+            dynamic,
         });
         self.variants.borrow_mut().insert(key.clone(), v.clone());
         v
@@ -2069,6 +2405,59 @@ pub unsafe extern "C" fn hz_pass_begin(
             // SAFETY: Java passes live views or null.
             .map(|&p| unsafe { p.as_ref() }.map(|v| &**v))
             .collect();
+        let size = views
+            .iter()
+            .flatten()
+            .next()
+            .map(|v| (v.width, v.height))
+            .or(depth.map(|d| (d.width, d.height)))
+            .unwrap_or((1, 1));
+        // Vulkan clears only the render area; a wgpu clear is the whole texture. A pass over part of a target
+        // (the game builds its atlases a sprite at a time) loads the target and clears the area with a draw.
+        let whole = area_x == 0 && area_y == 0 && area_w >= size.0 && area_h >= size.1;
+        let color_clears: Vec<bool> = (0..n as usize)
+            .map(|i| clears[i] != 0 && views[i].is_some())
+            .collect();
+        let depth_clears = clear_depth != 0 && depth.is_some();
+        let area_clear = if !whole && (color_clears.contains(&true) || depth_clears) {
+            let formats: Vec<Option<TextureFormat>> =
+                views.iter().map(|v| v.map(|v| v.format)).collect();
+            let pipeline = area_clear_pipeline(
+                ctx,
+                &formats,
+                &color_clears,
+                depth.map(|d| d.format),
+                depth_clears,
+            );
+            let mut values = [0f32; 4 * 8 + 4];
+            values[..rgba.len().min(32)].copy_from_slice(&rgba[..rgba.len().min(32)]);
+            values[32] = depth_clear as f32;
+            let data: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let uniform = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("horizon area clear"),
+                size: data.len() as u64,
+                usage: wgpu::BufferUsages::UNIFORM,
+                mapped_at_creation: true,
+            });
+            uniform
+                .slice(..)
+                .get_mapped_range_mut()
+                .expect("mapped at creation")
+                .copy_from_slice(&data);
+            uniform.unmap();
+            let layout = clear_layout(ctx);
+            let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &layout,
+                entries: &[wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform.as_entire_binding(),
+                }],
+            });
+            Some((pipeline, bind))
+        } else {
+            None
+        };
         let attachments: Vec<Option<wgpu::RenderPassColorAttachment>> = views
             .iter()
             .enumerate()
@@ -2078,7 +2467,7 @@ pub unsafe extern "C" fn hz_pass_begin(
                     depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: if clears[i] != 0 {
+                        load: if clears[i] != 0 && whole {
                             wgpu::LoadOp::Clear(wgpu::Color {
                                 r: f64::from(rgba[4 * i]),
                                 g: f64::from(rgba[4 * i + 1]),
@@ -2093,13 +2482,6 @@ pub unsafe extern "C" fn hz_pass_begin(
                 })
             })
             .collect();
-        let size = views
-            .iter()
-            .flatten()
-            .next()
-            .map(|v| (v.width, v.height))
-            .or(depth.map(|d| (d.width, d.height)))
-            .unwrap_or((1, 1));
         let encoder = ctx.encoder();
         let mut pass = encoder
             .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2108,7 +2490,7 @@ pub unsafe extern "C" fn hz_pass_begin(
                 depth_stencil_attachment: depth.map(|d| wgpu::RenderPassDepthStencilAttachment {
                     view: &d.attachment,
                     depth_ops: Some(wgpu::Operations {
-                        load: if clear_depth != 0 {
+                        load: if clear_depth != 0 && whole {
                             wgpu::LoadOp::Clear(depth_clear as f32)
                         } else {
                             wgpu::LoadOp::Load
@@ -2150,6 +2532,11 @@ pub unsafe extern "C" fn hz_pass_begin(
             area.2.max(1).min(size.0),
             area.3.max(1).min(size.1),
         );
+        if let Some((pipeline, bind)) = area_clear {
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bind, &[]);
+            pass.draw(0..3, 0..1);
+        }
         ctx.pass = Some(Pass {
             pass,
             colors: views.iter().map(|v| v.map(|v| v.format)).collect(),
@@ -2160,6 +2547,12 @@ pub unsafe extern "C" fn hz_pass_begin(
             dirty: true,
             variant: None,
             index_format: wgpu::IndexFormat::Uint16,
+            index: None,
+            first_color: views
+                .iter()
+                .flatten()
+                .next()
+                .map(|v| (v.texture.clone(), v.base_mip)),
         });
         Ok(1)
     })
@@ -2170,7 +2563,26 @@ pub unsafe extern "C" fn hz_pass_begin(
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hz_pass_end(ctx: *mut Ctx) {
     guard(ctx, (), |ctx| {
-        ctx.pass = None;
+        let pass = ctx.pass.take();
+        if let (Some(n), Some(dir), Some((texture, mip))) = (
+            ctx.dump_passes,
+            std::env::var_os("HZ_WGPU_DUMP_ALL"),
+            pass.and_then(|p| p.first_color),
+        ) {
+            ctx.dump_passes = Some(n + 1);
+            if texture.format() == TextureFormat::Rgba8Unorm {
+                let size = texture
+                    .size()
+                    .mip_level_size(mip, wgpu::TextureDimension::D2);
+                let name = format!("pass-{n:03}-{}x{}.ppm", size.width, size.height);
+                dump_texture(
+                    ctx,
+                    &texture,
+                    mip,
+                    &std::path::Path::new(&dir).join(name).to_string_lossy(),
+                );
+            }
+        }
         Ok(())
     })
 }
@@ -2333,14 +2745,22 @@ pub unsafe extern "C" fn hz_pass_index(ctx: *mut Ctx, buf: *const Buf, int32: u3
         };
         pass.pass
             .set_index_buffer(buffer.slice(..), pass.index_format);
+        pass.index = Some(buffer);
         Ok(())
     })
 }
 
 /// Sets the pipeline variant and bind groups the next draw needs.
+// wgpu's handles hash and compare by their id, not by what they hold.
+#[allow(clippy::mutable_key_type)]
 fn prepare(ctx: &mut Ctx) -> Result<(), String> {
     let device = ctx.device.clone();
-    let pass = pass(ctx)?;
+    let serial = ctx.serial + 1;
+    let groups = &mut ctx.groups;
+    let pass = ctx
+        .pass
+        .as_mut()
+        .ok_or_else(|| "no render pass is open".to_string())?;
     let pipeline = pass.pipeline.clone().ok_or("draw without a pipeline")?;
     if !pass.dirty && pass.variant.is_some() {
         return Ok(());
@@ -2423,35 +2843,62 @@ fn prepare(ctx: &mut Ctx) -> Result<(), String> {
                 }
             }
         }
-        let mut list: Vec<wgpu::BindGroupEntry> = Vec::new();
-        for (binding, b, offset, len) in &buffers {
-            list.push(wgpu::BindGroupEntry {
-                binding: *binding,
-                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                    buffer: b,
-                    offset: *offset,
-                    size: std::num::NonZeroU64::new(*len),
-                }),
-            });
+        let mut entries: Vec<(u32, GroupEntry)> = Vec::new();
+        let mut offsets: Vec<(u32, u32)> = Vec::new();
+        for (binding, b, offset, len) in buffers {
+            if variant.dynamic.contains(&(*group, binding)) {
+                offsets.push((binding, offset as u32));
+                entries.push((binding, GroupEntry::Buffer(b, 0, len)));
+            } else {
+                entries.push((binding, GroupEntry::Buffer(b, offset, len)));
+            }
         }
-        for (binding, v) in &views {
-            list.push(wgpu::BindGroupEntry {
-                binding: *binding,
-                resource: wgpu::BindingResource::TextureView(v),
-            });
+        offsets.sort_unstable();
+        let offsets: Vec<u32> = offsets.into_iter().map(|o| o.1).collect();
+        for (binding, v) in views {
+            entries.push((binding, GroupEntry::View(v)));
         }
-        for (binding, s) in &samplers {
-            list.push(wgpu::BindGroupEntry {
-                binding: *binding,
-                resource: wgpu::BindingResource::Sampler(s),
-            });
+        for (binding, s) in samplers {
+            entries.push((binding, GroupEntry::Sampler(s)));
         }
-        let group_obj = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout,
-            entries: &list,
-        });
-        pass.pass.set_bind_group(*group, &group_obj, &[]);
+        let key = GroupKey {
+            layout: layout.clone(),
+            entries,
+        };
+        let group_obj = match groups.get_mut(&key) {
+            Some((g, used)) => {
+                *used = serial;
+                g.clone()
+            }
+            None => {
+                let list: Vec<wgpu::BindGroupEntry> = key
+                    .entries
+                    .iter()
+                    .map(|(binding, e)| wgpu::BindGroupEntry {
+                        binding: *binding,
+                        resource: match e {
+                            GroupEntry::Buffer(b, offset, len) => {
+                                wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                    buffer: b,
+                                    offset: *offset,
+                                    size: std::num::NonZeroU64::new(*len),
+                                })
+                            }
+                            GroupEntry::View(v) => wgpu::BindingResource::TextureView(v),
+                            GroupEntry::Sampler(s) => wgpu::BindingResource::Sampler(s),
+                        },
+                    })
+                    .collect();
+                let g = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout,
+                    entries: &list,
+                });
+                groups.insert(key, (g.clone(), serial));
+                g
+            }
+        };
+        pass.pass.set_bind_group(*group, &group_obj, &offsets);
     }
     pass.variant = Some(variant);
     pass.dirty = false;
@@ -2471,6 +2918,10 @@ pub unsafe extern "C" fn hz_pass_draw(
     guard(ctx, (), |ctx| {
         prepare(ctx)?;
         ctx.draws += 1;
+        if pass(ctx)?.pipeline.as_ref().is_some_and(|p| p.fan) {
+            // wgpu has no triangle fans: the fan's triangles go as a list, `first` as the base vertex.
+            return fan_draw(ctx, None, vertices, instances, first as i32, first_instance);
+        }
         pass(ctx)?.pass.draw(
             first..first + vertices,
             first_instance..first_instance + instances,
@@ -2502,36 +2953,297 @@ pub unsafe extern "C" fn hz_pass_draw_indexed(
     })
 }
 
+/// Draws in one call, as the game's Vulkan backend hands them to `vkCmdDrawMulti(Indexed)EXT`: `count` draws
+/// whose parameters are at `params`, `(first index, index count, vertex offset)` each when `indexed`, else
+/// `(first vertex, vertex count)`, all with the same instances.
+///
+/// # Safety
+/// `ctx` is live; `params` points at `count` draws' parameters.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hz_pass_multi_draw(
+    ctx: *mut Ctx,
+    params: *const i32,
+    count: u32,
+    instances: u32,
+    first_instance: u32,
+    indexed: u32,
+) {
+    guard(ctx, (), |ctx| {
+        prepare(ctx)?;
+        let stride = if indexed != 0 { 3 } else { 2 };
+        // SAFETY: as the caller promises.
+        let params = unsafe { std::slice::from_raw_parts(params, count as usize * stride) };
+        ctx.draws += count;
+        let pass = pass(ctx)?;
+        let instances = first_instance..first_instance + instances;
+        for p in params.chunks_exact(stride) {
+            if indexed != 0 {
+                let (first, n) = (p[0] as u32, p[1] as u32);
+                pass.pass
+                    .draw_indexed(first..first + n, p[2], instances.clone());
+            } else {
+                let (first, n) = (p[0] as u32, p[1] as u32);
+                pass.pass.draw(first..first + n, instances.clone());
+            }
+        }
+        Ok(())
+    })
+}
+
+/// `count` draws whose parameters the GPU reads from `buf` at `offset` (tightly packed, as Vulkan's
+/// `vkCmdDraw(Indexed)Indirect` reads them).
+///
+/// # Safety
+/// `ctx` and `buf` are live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hz_pass_draw_indirect(
+    ctx: *mut Ctx,
+    buf: *const Buf,
+    offset: u64,
+    count: u32,
+    indexed: u32,
+) {
+    guard(ctx, (), |ctx| {
+        prepare(ctx)?;
+        // SAFETY: as the caller promises.
+        let buffer = unsafe { &*buf }.buffer.clone();
+        ctx.draws += count;
+        let pass = pass(ctx)?;
+        match (indexed != 0, count) {
+            (_, 0) => {}
+            (true, 1) => pass.pass.draw_indexed_indirect(&buffer, offset),
+            (false, 1) => pass.pass.draw_indirect(&buffer, offset),
+            (true, n) => pass.pass.multi_draw_indexed_indirect(&buffer, offset, n),
+            (false, n) => pass.pass.multi_draw_indirect(&buffer, offset, n),
+        }
+        Ok(())
+    })
+}
+
+/// An indexed triangle fan: `count` of the bound index buffer's indices from `first`, which Java passes from its
+/// copy of that buffer (`src`, `len` bytes of 16- or 32-bit indices), or null when it has none, for the game's
+/// sequential index buffer (index `i` is `i`).
+///
+/// # Safety
+/// `ctx` is live; `src` points at `len` bytes, or is null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hz_pass_draw_fan_indexed(
+    ctx: *mut Ctx,
+    src: *const u8,
+    len: u64,
+    int32: u32,
+    count: u32,
+    instances: u32,
+    first: u32,
+    base_vertex: i32,
+    first_instance: u32,
+) {
+    guard(ctx, (), |ctx| {
+        prepare(ctx)?;
+        ctx.draws += 1;
+        if src.is_null() {
+            return fan_draw(
+                ctx,
+                None,
+                count,
+                instances,
+                base_vertex + first as i32,
+                first_instance,
+            );
+        }
+        // SAFETY: as the caller promises.
+        let data = unsafe { bytes(src, len) };
+        let at = |i: u32| -> Option<u32> {
+            let i = (first + i) as usize;
+            if int32 != 0 {
+                data.get(4 * i..4 * i + 4)
+                    .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            } else {
+                data.get(2 * i..2 * i + 2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]) as u32)
+            }
+        };
+        let mut list = Vec::with_capacity(3 * count.saturating_sub(2) as usize);
+        for k in 0..count.saturating_sub(2) {
+            for i in [0, k + 1, k + 2] {
+                list.push(at(i).ok_or("fan indices past the end of the index buffer")?);
+            }
+        }
+        fan_draw(
+            ctx,
+            Some(list),
+            count,
+            instances,
+            base_vertex,
+            first_instance,
+        )
+    })
+}
+
+/// Draws a triangle fan of `count` vertices as a triangle list: through `list` (its triangles' indices) when
+/// given, else through the shared `[0, k + 1, k + 2]` list from `base_vertex`. The game's index buffer is bound
+/// again afterwards.
+fn fan_draw(
+    ctx: &mut Ctx,
+    list: Option<Vec<u32>>,
+    count: u32,
+    instances: u32,
+    base_vertex: i32,
+    first_instance: u32,
+) -> Result<(), String> {
+    use wgpu::util::DeviceExt;
+    if count < 3 {
+        return Ok(());
+    }
+    let triangles = 3 * (count - 2);
+    let buffer = match list {
+        Some(list) => ctx
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("horizon fan"),
+                contents: &list
+                    .iter()
+                    .flat_map(|i| i.to_le_bytes())
+                    .collect::<Vec<u8>>(),
+                usage: wgpu::BufferUsages::INDEX,
+            }),
+        None => fan_indices(ctx, count),
+    };
+    let pass = pass(ctx)?;
+    pass.pass
+        .set_index_buffer(buffer.slice(..), wgpu::IndexFormat::Uint32);
+    pass.pass.draw_indexed(
+        0..triangles,
+        base_vertex,
+        first_instance..first_instance + instances,
+    );
+    if let Some(index) = &pass.index {
+        pass.pass
+            .set_index_buffer(index.slice(..), pass.index_format);
+    }
+    Ok(())
+}
+
+/// The shared fan list, grown to cover `count` vertices.
+fn fan_indices(ctx: &mut Ctx, count: u32) -> wgpu::Buffer {
+    use wgpu::util::DeviceExt;
+    if let Some((buffer, covers)) = &ctx.fan
+        && *covers >= count
+    {
+        return buffer.clone();
+    }
+    let covers = count.next_power_of_two().max(64);
+    let list: Vec<u8> = (0..covers - 2)
+        .flat_map(|k| [0, k + 1, k + 2])
+        .flat_map(u32::to_le_bytes)
+        .collect();
+    let buffer = ctx
+        .device
+        .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("horizon fan list"),
+            contents: &list,
+            usage: wgpu::BufferUsages::INDEX,
+        });
+    ctx.fan = Some((buffer.clone(), covers));
+    buffer
+}
+
 // ---------------------------------------------------------------------------------------------------------------
 // Surface
 
-/// A surface on a Win32 window (`hwnd`, `hinstance`).
+/// A window as Java describes it from SDL's window properties: `kind` 1 Win32 (`a` HWND, `b` HINSTANCE), 2 X11
+/// (`a` window, `b` Display*), 3 Wayland (`a` wl_surface*, `b` wl_display*), 4 Cocoa (`a` the NSView SDL made for Metal).
+#[repr(C)]
+pub struct WindowTarget {
+    kind: u32,
+    a: *mut c_void,
+    b: *mut c_void,
+}
+
+/// # Safety
+/// The target describes a live window that outlives the surface.
+unsafe fn create_surface(
+    instance: &wgpu::Instance,
+    t: &WindowTarget,
+) -> Result<wgpu::Surface<'static>, String> {
+    use raw_window_handle as rwh;
+    let nonnull = |p: *mut c_void| std::ptr::NonNull::new(p).ok_or("a null window handle");
+    let target = match t.kind {
+        1 => {
+            let mut window =
+                rwh::Win32WindowHandle::new(NonZeroIsize::new(t.a as isize).ok_or("no window")?);
+            window.hinstance = NonZeroIsize::new(t.b as isize);
+            wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: Some(rwh::RawDisplayHandle::Windows(
+                    rwh::WindowsDisplayHandle::new(),
+                )),
+                raw_window_handle: rwh::RawWindowHandle::Win32(window),
+            }
+        }
+        2 => wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(rwh::RawDisplayHandle::Xlib(rwh::XlibDisplayHandle::new(
+                Some(nonnull(t.b)?),
+                0,
+            ))),
+            raw_window_handle: rwh::RawWindowHandle::Xlib(rwh::XlibWindowHandle::new(
+                t.a as std::ffi::c_ulong,
+            )),
+        },
+        3 => wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(rwh::RawDisplayHandle::Wayland(
+                rwh::WaylandDisplayHandle::new(nonnull(t.b)?),
+            )),
+            raw_window_handle: rwh::RawWindowHandle::Wayland(rwh::WaylandWindowHandle::new(
+                nonnull(t.a)?,
+            )),
+        },
+        4 => wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(rwh::RawDisplayHandle::AppKit(
+                rwh::AppKitDisplayHandle::new(),
+            )),
+            raw_window_handle: rwh::RawWindowHandle::AppKit(rwh::AppKitWindowHandle::new(nonnull(
+                t.a,
+            )?)),
+        },
+        k => return Err(format!("window kind {k}")),
+    };
+    // SAFETY: as the caller promises.
+    unsafe { instance.create_surface_unsafe(target) }.map_err(|e| e.to_string())
+}
+
+/// A surface on the game's window.
 ///
 /// # Safety
-/// `ctx` is live; the handles name a live window that outlives the surface.
+/// `ctx` is live; `target` describes a live window that outlives the surface.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hz_surface_create(
     ctx: *mut Ctx,
-    hwnd: *mut c_void,
-    hinstance: *mut c_void,
+    target: *const WindowTarget,
 ) -> *mut Surface {
     guard(ctx, std::ptr::null_mut(), |ctx| {
-        let hwnd = NonZeroIsize::new(hwnd as isize).ok_or("no window")?;
-        let mut window = raw_window_handle::Win32WindowHandle::new(hwnd);
-        window.hinstance = NonZeroIsize::new(hinstance as isize);
+        if std::env::var_os("HZ_WGPU_HEADLESS").is_some() {
+            return Ok(Box::into_raw(Box::new(Surface {
+                surface: None,
+                config: None,
+                current: None,
+                suboptimal: false,
+            })));
+        }
         // SAFETY: as the caller promises.
-        let surface = unsafe {
-            ctx.instance
-                .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                    raw_display_handle: Some(raw_window_handle::RawDisplayHandle::Windows(
-                        raw_window_handle::WindowsDisplayHandle::new(),
-                    )),
-                    raw_window_handle: raw_window_handle::RawWindowHandle::Win32(window),
-                })
-                .map_err(|e| e.to_string())?
-        };
+        let surface = unsafe { create_surface(&ctx.instance, &*target)? };
+        if std::env::var_os("HZ_WGPU_TRACE").is_some() {
+            for a in pollster::block_on(ctx.instance.enumerate_adapters(wgpu::Backends::all())) {
+                eprintln!(
+                    "[horizon-wgpu] adapter {:?} {} {:?}: surface supported {}",
+                    a.get_info().backend,
+                    a.get_info().name,
+                    a.get_info().device_type,
+                    a.is_surface_supported(&surface)
+                );
+            }
+        }
         Ok(Box::into_raw(Box::new(Surface {
-            surface,
+            surface: Some(surface),
             config: None,
             current: None,
             suboptimal: false,
@@ -2565,13 +3277,16 @@ pub unsafe extern "C" fn hz_surface_configure(
     guard(ctx, 0, |ctx| {
         // SAFETY: as the caller promises.
         let s = unsafe { &mut *s };
-        let caps = s.surface.get_capabilities(&ctx.adapter);
+        let Some(surface) = s.surface.as_ref() else {
+            return Ok(1);
+        };
+        let caps = surface.get_capabilities(&ctx.adapter);
         if caps.formats.is_empty() {
             return Err(format!(
                 "the surface has no format on {:?} ({}); the adapter supports it: {}",
                 ctx.adapter.get_info().backend,
                 ctx.adapter.get_info().name,
-                ctx.adapter.is_surface_supported(&s.surface)
+                ctx.adapter.is_surface_supported(surface)
             ));
         }
         let format = [TextureFormat::Bgra8Unorm, TextureFormat::Rgba8Unorm]
@@ -2606,7 +3321,7 @@ pub unsafe extern "C" fn hz_surface_configure(
             color_space: Default::default(),
         };
         s.current = None;
-        s.surface.configure(&ctx.device, &config);
+        surface.configure(&ctx.device, &config);
         s.config = Some(config);
         Ok(1)
     })
@@ -2621,7 +3336,10 @@ pub unsafe extern "C" fn hz_surface_modes(ctx: *mut Ctx, s: *mut Surface) -> u32
     guard(ctx, 4, |ctx| {
         // SAFETY: as the caller promises.
         let s = unsafe { &*s };
-        let caps = s.surface.get_capabilities(&ctx.adapter);
+        let Some(surface) = s.surface.as_ref() else {
+            return Ok(4);
+        };
+        let caps = surface.get_capabilities(&ctx.adapter);
         let mut bits = 0;
         for m in caps.present_modes {
             bits |= match m {
@@ -2647,7 +3365,10 @@ pub unsafe extern "C" fn hz_surface_acquire(ctx: *mut Ctx, s: *mut Surface) -> i
         // SAFETY: as the caller promises.
         let s = unsafe { &mut *s };
         s.current = None;
-        Ok(match s.surface.get_current_texture() {
+        let Some(surface) = s.surface.as_ref() else {
+            return Ok(1);
+        };
+        Ok(match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(t) => {
                 s.suboptimal = false;
                 s.current = Some(t);
@@ -2715,12 +3436,44 @@ pub unsafe extern "C" fn hz_surface_blit(ctx: *mut Ctx, s: *mut Surface, view: *
         uniform.unmap();
         let source = view.sampled(wgpu::TextureViewDimension::D2);
         ctx.presented += 1;
-        if let Ok(path) = std::env::var("HZ_WGPU_DUMP")
-            && ctx.presented
+        let dump_frame = std::mem::take(&mut ctx.dump_next)
+            || ctx.presented
                 == std::env::var("HZ_WGPU_DUMP_FRAME")
                     .ok()
                     .and_then(|v| v.parse().ok())
-                    .unwrap_or(200)
+                    .unwrap_or(u64::MAX);
+        // The pass dumps cover the frame after a dump.
+        ctx.dump_passes = if dump_frame && std::env::var_os("HZ_WGPU_DUMP_ALL").is_some() {
+            Some(0)
+        } else {
+            None
+        };
+        if let Some(dir) = std::env::var_os("HZ_WGPU_DUMP_ALL")
+            && dump_frame
+        {
+            let textures = std::mem::take(&mut ctx.textures);
+            for (i, t) in textures.iter().enumerate() {
+                if t.width() >= 16 && t.height() >= 16 && t.width() * t.height() <= 4096 * 4096 {
+                    // Every mip of the large ones (atlases), the first of the rest.
+                    let mips = if t.width() >= 1024 {
+                        t.mip_level_count()
+                    } else {
+                        1
+                    };
+                    for mip in 0..mips {
+                        let name = format!("{}x{}-{i}-mip{mip}.ppm", t.width(), t.height());
+                        dump_texture(
+                            ctx,
+                            t,
+                            mip,
+                            &std::path::Path::new(&dir).join(name).to_string_lossy(),
+                        );
+                    }
+                }
+            }
+        }
+        if let Ok(path) = std::env::var("HZ_WGPU_DUMP")
+            && dump_frame
         {
             dump(ctx, view, &path);
         }
@@ -2764,7 +3517,28 @@ pub unsafe extern "C" fn hz_surface_blit(ctx: *mut Ctx, s: *mut Surface, view: *
 
 /// Debugging (`HZ_WGPU_DUMP`): the frame being presented, as a PPM file, rows as the screen shows them.
 fn dump(ctx: &mut Ctx, view: &View, path: &str) {
-    let (w, h) = (view.width, view.height);
+    let texture = view.texture.clone();
+    dump_texture(ctx, &texture, view.base_mip, path);
+}
+
+/// Debugging: the dumps (`HZ_WGPU_DUMP`, `HZ_WGPU_DUMP_ALL`) are written at the next present.
+///
+/// # Safety
+/// `ctx` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hz_dump_next(ctx: *mut Ctx) {
+    guard(ctx, (), |ctx| {
+        ctx.dump_next = true;
+        Ok(())
+    })
+}
+
+/// A texture's mip as a PPM file (RGB of RGBA8), rows as the screen shows them.
+fn dump_texture(ctx: &mut Ctx, texture: &wgpu::Texture, mip: u32, path: &str) {
+    let size = texture
+        .size()
+        .mip_level_size(mip, wgpu::TextureDimension::D2);
+    let (w, h) = (size.width, size.height);
     let padded = (w * 4).div_ceil(256) * 256;
     let buffer = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("horizon dump"),
@@ -2772,11 +3546,10 @@ fn dump(ctx: &mut Ctx, view: &View, path: &str) {
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    let texture = view.texture.clone();
     ctx.encoder().copy_texture_to_buffer(
         wgpu::TexelCopyTextureInfo {
-            texture: &texture,
-            mip_level: view.base_mip,
+            texture,
+            mip_level: mip,
             origin: wgpu::Origin3d::ZERO,
             aspect: wgpu::TextureAspect::All,
         },
@@ -2814,7 +3587,6 @@ fn dump(ctx: &mut Ctx, view: &View, path: &str) {
         }
     }
     let _ = std::fs::write(path, out);
-    eprintln!("[horizon-wgpu] dumped the presented frame to {path}");
 }
 
 fn blit_pipeline(ctx: &mut Ctx, format: TextureFormat) -> wgpu::RenderPipeline {
@@ -2925,5 +3697,168 @@ pub unsafe extern "C" fn hz_surface_present(ctx: *mut Ctx, s: *mut Surface) -> u
             ctx.queue.present(t);
         }
         Ok(serial)
+    })
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Timestamps
+
+/// A timestamp query pool: wgpu's query set, the buffers its values are resolved into and read from, and for
+/// each query the submit that wrote it last (0: never).
+pub struct Timestamps {
+    set: wgpu::QuerySet,
+    resolve: wgpu::Buffer,
+    read: wgpu::Buffer,
+    written: Vec<u64>,
+    /// Queries written since the last submit.
+    pending: Vec<u32>,
+}
+
+/// A pool of `count` timestamps, or null when the device has no timestamp queries.
+///
+/// # Safety
+/// `ctx` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hz_timestamps_create(
+    ctx: *mut Ctx,
+    count: u32,
+) -> *mut Rc<RefCell<Timestamps>> {
+    guard(ctx, std::ptr::null_mut(), |ctx| {
+        let wanted = wgpu::Features::TIMESTAMP_QUERY
+            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_ENCODERS
+            | wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES;
+        if !ctx.device.features().contains(wanted) || count == 0 {
+            return Ok(std::ptr::null_mut());
+        }
+        let set = ctx.device.create_query_set(&wgpu::QuerySetDescriptor {
+            label: Some("horizon timestamps"),
+            ty: wgpu::QueryType::Timestamp,
+            count,
+        });
+        let resolve = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("horizon timestamps resolve"),
+            size: u64::from(count) * wgpu::QUERY_RESOLVE_BUFFER_ALIGNMENT,
+            usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let read = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("horizon timestamps read"),
+            size: u64::from(count) * 8,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Ok(Box::into_raw(Box::new(Rc::new(RefCell::new(Timestamps {
+            set,
+            resolve,
+            read,
+            written: vec![0; count as usize],
+            pending: Vec::new(),
+        })))))
+    })
+}
+
+/// # Safety
+/// `pool` came from [`hz_timestamps_create`] and is not used again.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hz_timestamps_free(pool: *mut Rc<RefCell<Timestamps>>) {
+    if !pool.is_null() {
+        // SAFETY: as the caller promises.
+        drop(unsafe { Box::from_raw(pool) });
+    }
+}
+
+/// Writes the GPU's time into query `index` once the commands recorded before it are done (in the open pass, or
+/// between commands).
+///
+/// # Safety
+/// `ctx` and `pool` are live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hz_timestamp_write(
+    ctx: *mut Ctx,
+    pool: *const Rc<RefCell<Timestamps>>,
+    index: u32,
+) {
+    guard(ctx, (), |ctx| {
+        // SAFETY: as the caller promises.
+        let pool = unsafe { &*pool }.clone();
+        {
+            let mut p = pool.borrow_mut();
+            if index as usize >= p.written.len() {
+                return Err(format!("timestamp {index} of {}", p.written.len()));
+            }
+            match ctx.pass.as_mut() {
+                Some(pass) => pass.pass.write_timestamp(&p.set, index),
+                None => ctx.encoder().write_timestamp(&p.set, index),
+            }
+            if !p.pending.contains(&index) {
+                p.pending.push(index);
+            }
+        }
+        if !ctx.timestamps.iter().any(|t| Rc::ptr_eq(t, &pool)) {
+            ctx.timestamps.push(pool);
+        }
+        Ok(())
+    })
+}
+
+/// Queries `first` to `first + count` in nanoseconds into `out`, -1 for each not written or not done yet. Does
+/// not wait for the GPU.
+///
+/// # Safety
+/// `ctx` and `pool` are live; `out` points at `count` values.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hz_timestamps_read(
+    ctx: *mut Ctx,
+    pool: *const Rc<RefCell<Timestamps>>,
+    first: u32,
+    count: u32,
+    out: *mut i64,
+) {
+    guard(ctx, (), |ctx| {
+        // SAFETY: as the caller promises.
+        let (pool, out) = unsafe { (&*pool, std::slice::from_raw_parts_mut(out, count as usize)) };
+        out.fill(-1);
+        let p = pool.borrow();
+        let _ = ctx.device.poll(wgpu::PollType::Poll);
+        let completed = ctx.completed.load(Ordering::Acquire);
+        let ready: Vec<bool> = (first..first + count)
+            .map(|i| {
+                p.written
+                    .get(i as usize)
+                    .is_some_and(|&w| w != 0 && w <= completed)
+            })
+            .collect();
+        if !ready.contains(&true) {
+            return Ok(());
+        }
+        // The copies into the read buffer that are done are all that is in it to map: map, read, unmap now.
+        let slice = p.read.slice(..);
+        let mapped = Arc::new(AtomicU64::new(0));
+        let flag = mapped.clone();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            flag.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release);
+        });
+        let _ = ctx.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: Some(Duration::from_secs(5)),
+        });
+        if mapped.load(Ordering::Acquire) != 1 {
+            return Err("timestamps did not map".into());
+        }
+        let period = f64::from(ctx.queue.get_timestamp_period());
+        {
+            let view = slice
+                .get_mapped_range()
+                .map_err(|e| format!("timestamps: {e:?}"))?;
+            for (k, i) in (first..first + count).enumerate() {
+                if ready[k] {
+                    let at = i as usize * 8;
+                    let ticks = u64::from_le_bytes(view[at..at + 8].try_into().expect("8 bytes"));
+                    out[k] = (ticks as f64 * period) as i64;
+                }
+            }
+        }
+        p.read.unmap();
+        Ok(())
     })
 }

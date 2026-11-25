@@ -153,12 +153,15 @@ final class WgpuEncoder implements CommandEncoderBackend {
     @Override
     public void writeToBuffer(GpuBufferSlice slice, ByteBuffer data) {
         Trace.count("writeToBuffer " + data.remaining());
-        Native.bufferWrite(ctx(), ((WgpuBuffer) slice.buffer()).handle, slice.offset(), data);
+        WgpuBuffer b = (WgpuBuffer) slice.buffer();
+        b.written(slice.offset(), data);
+        Native.bufferWrite(ctx(), b.handle, slice.offset(), data);
     }
 
     @Override
     public void copyToBuffer(GpuBufferSlice source, GpuBufferSlice destination) {
         Trace.count("copyToBuffer");
+        ((WgpuBuffer) destination.buffer()).gpuWritten();
         Native.bufferCopy(ctx(), ((WgpuBuffer) source.buffer()).handle, source.offset(),
                 ((WgpuBuffer) destination.buffer()).handle, destination.offset(),
                 Math.min(source.length(), destination.length()));
@@ -189,6 +192,7 @@ final class WgpuEncoder implements CommandEncoderBackend {
     @Override
     public void copyTextureToBuffer(GpuTexture source, GpuBuffer destination, long offset, Runnable callback,
             int mipLevel, int x, int y, int width, int height) {
+        ((WgpuBuffer) destination).gpuWritten();
         Native.textureToBuffer(ctx(), tex(source), ((WgpuBuffer) destination).handle, offset, mipLevel, x, y, width,
                 height);
         if (callback != null) {
@@ -213,7 +217,9 @@ final class WgpuEncoder implements CommandEncoderBackend {
     }
 
     @Override
-    public void writeTimestamp(GpuQueryPool pool, int index) {}
+    public void writeTimestamp(GpuQueryPool pool, int index) {
+        ((WgpuQueryPool) pool).write(index);
+    }
 
     /** Done once the GPU has finished the submission with its serial. */
     final class Fence implements GpuFence {

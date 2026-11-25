@@ -34,9 +34,12 @@ final class Native {
     private static MethodHandle SAMPLER_CREATE, SAMPLER_FREE, PIPELINE_CREATE, PIPELINE_FREE, DEVICE,
             PIPELINE_ERROR;
     private static MethodHandle PASS_BEGIN, PASS_END, PASS_PIPELINE, PASS_BUFFER, PASS_TEXTURE, PASS_IMMEDIATES,
-            PASS_SCISSOR, PASS_VERTEX, PASS_INDEX, PASS_DRAW, PASS_DRAW_INDEXED;
+            PASS_SCISSOR, PASS_VERTEX, PASS_INDEX, PASS_DRAW, PASS_DRAW_INDEXED, PASS_DRAW_FAN_INDEXED,
+            PASS_MULTI_DRAW, PASS_DRAW_INDIRECT, TS_CREATE, TS_FREE, TS_WRITE, TS_READ;
     private static MethodHandle SURF_CREATE, SURF_FREE, SURF_CONFIGURE, SURF_MODES, SURF_ACQUIRE, SURF_SUBOPTIMAL,
-            SURF_BLIT, SURF_PRESENT;
+            SURF_BLIT, SURF_PRESENT, DUMP_NEXT;
+    /** The device context, for debugging hooks that have no device at hand (see {@link #dumpNext}). */
+    static volatile MemorySegment current = MemorySegment.NULL;
 
     private Native() {}
 
@@ -56,7 +59,7 @@ final class Native {
             throw new IllegalStateException("hz.wgpu.lib is not set");
         }
         lib = SymbolLookup.libraryLookup(Path.of(path), Arena.global());
-        CREATE = h("hz_create", P);
+        CREATE = h("hz_create", P, P);
         DESTROY = h("hz_destroy", null, P);
         INFO = h("hz_info", I32, P, P, I32);
         ERROR = h("hz_error", I32, P, P, I32);
@@ -97,7 +100,14 @@ final class Native {
         PASS_INDEX = h("hz_pass_index", null, P, P, I32);
         PASS_DRAW = h("hz_pass_draw", null, P, I32, I32, I32, I32);
         PASS_DRAW_INDEXED = h("hz_pass_draw_indexed", null, P, I32, I32, I32, I32, I32);
-        SURF_CREATE = h("hz_surface_create", P, P, P, P);
+        PASS_DRAW_FAN_INDEXED = h("hz_pass_draw_fan_indexed", null, P, P, I64, I32, I32, I32, I32, I32, I32);
+        PASS_MULTI_DRAW = h("hz_pass_multi_draw", null, P, P, I32, I32, I32, I32);
+        PASS_DRAW_INDIRECT = h("hz_pass_draw_indirect", null, P, P, I64, I32, I32);
+        TS_CREATE = h("hz_timestamps_create", P, P, I32);
+        TS_FREE = h("hz_timestamps_free", null, P);
+        TS_WRITE = h("hz_timestamp_write", null, P, P, I32);
+        TS_READ = h("hz_timestamps_read", null, P, P, I32, I32, P);
+        SURF_CREATE = h("hz_surface_create", P, P, P);
         SURF_FREE = h("hz_surface_free", null, P);
         SURF_CONFIGURE = h("hz_surface_configure", I32, P, P, I32, I32, I32);
         SURF_MODES = h("hz_surface_modes", I32, P, P);
@@ -105,6 +115,7 @@ final class Native {
         SURF_SUBOPTIMAL = h("hz_surface_suboptimal", I32, P);
         SURF_BLIT = h("hz_surface_blit", null, P, P, P);
         SURF_PRESENT = h("hz_surface_present", I64, P, P);
+        DUMP_NEXT = h("hz_dump_next", null, P);
     }
 
     static RuntimeException fail(Throwable t) {
@@ -134,9 +145,22 @@ final class Native {
 
     // Device
 
-    static synchronized MemorySegment create() {
+    /** A device whose adapter can present to the window {@code probe} describes (NULL: the first adapter). */
+    static synchronized MemorySegment create(MemorySegment probe) {
         try {
-            return (MemorySegment) CREATE.invokeExact();
+            return (MemorySegment) CREATE.invokeExact(probe);
+        } catch (Throwable t) {
+            throw fail(t);
+        }
+    }
+
+    /** Debugging: the Rust side writes its dumps (HZ_WGPU_DUMP, HZ_WGPU_DUMP_ALL) at the next present. */
+    static synchronized void dumpNext() {
+        if (DUMP_NEXT == null || current.equals(MemorySegment.NULL)) {
+            return;
+        }
+        try {
+            DUMP_NEXT.invokeExact(current);
         } catch (Throwable t) {
             throw fail(t);
         }
@@ -493,6 +517,75 @@ final class Native {
         }
     }
 
+    /** {@code count} draws in one call: (first index, index count, vertex offset) ints each when {@code indexed},
+     * else (first vertex, vertex count), at {@code params} (native memory). */
+    static synchronized void passMultiDraw(MemorySegment ctx, MemorySegment params, int count, int instances,
+            int firstInstance, boolean indexed) {
+        try {
+            PASS_MULTI_DRAW.invokeExact(ctx, params, count, instances, firstInstance, indexed ? 1 : 0);
+        } catch (Throwable t) {
+            throw fail(t);
+        }
+    }
+
+    /** A pool of {@code count} timestamps, or NULL when the device has no timestamp queries. */
+    static synchronized MemorySegment timestampsCreate(MemorySegment ctx, int count) {
+        try {
+            return (MemorySegment) TS_CREATE.invokeExact(ctx, count);
+        } catch (Throwable t) {
+            throw fail(t);
+        }
+    }
+
+    static synchronized void timestampsFree(MemorySegment pool) {
+        try {
+            TS_FREE.invokeExact(pool);
+        } catch (Throwable t) {
+            throw fail(t);
+        }
+    }
+
+    static synchronized void timestampWrite(MemorySegment ctx, MemorySegment pool, int index) {
+        try {
+            TS_WRITE.invokeExact(ctx, pool, index);
+        } catch (Throwable t) {
+            throw fail(t);
+        }
+    }
+
+    /** Nanoseconds into {@code out} ({@code count} longs), -1 for each not written or not done yet. */
+    static synchronized void timestampsRead(MemorySegment ctx, MemorySegment pool, int first, int count,
+            MemorySegment out) {
+        try {
+            TS_READ.invokeExact(ctx, pool, first, count, out);
+        } catch (Throwable t) {
+            throw fail(t);
+        }
+    }
+
+    /** {@code count} draws whose parameters the GPU reads from {@code buf} at {@code offset}. */
+    static synchronized void passDrawIndirect(MemorySegment ctx, MemorySegment buf, long offset, int count,
+            boolean indexed) {
+        try {
+            PASS_DRAW_INDIRECT.invokeExact(ctx, buf, offset, count, indexed ? 1 : 0);
+        } catch (Throwable t) {
+            throw fail(t);
+        }
+    }
+
+    /** An indexed triangle fan: {@code indices} is the bound index buffer's CPU copy, or null for the game's
+     * sequential index buffer. */
+    static synchronized void passDrawFanIndexed(MemorySegment ctx, MemorySegment indices, boolean int32, int count,
+            int instances, int first, int baseVertex, int firstInstance) {
+        try {
+            PASS_DRAW_FAN_INDEXED.invokeExact(ctx, indices == null ? MemorySegment.NULL : indices,
+                    indices == null ? 0L : indices.byteSize(), int32 ? 1 : 0, count, instances, first, baseVertex,
+                    firstInstance);
+        } catch (Throwable t) {
+            throw fail(t);
+        }
+    }
+
     static synchronized void passDrawIndexed(MemorySegment ctx, int indices, int instances, int first,
             int baseVertex, int firstInstance) {
         try {
@@ -504,10 +597,9 @@ final class Native {
 
     // Surface
 
-    static synchronized MemorySegment surfaceCreate(MemorySegment ctx, long hwnd, long hinstance) {
+    static synchronized MemorySegment surfaceCreate(MemorySegment ctx, MemorySegment target) {
         try {
-            return (MemorySegment) SURF_CREATE.invokeExact(ctx, MemorySegment.ofAddress(hwnd),
-                    MemorySegment.ofAddress(hinstance));
+            return (MemorySegment) SURF_CREATE.invokeExact(ctx, target);
         } catch (Throwable t) {
             throw fail(t);
         }

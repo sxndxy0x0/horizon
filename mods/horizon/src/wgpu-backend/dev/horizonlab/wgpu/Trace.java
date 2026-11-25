@@ -18,7 +18,7 @@ final class Trace {
     }
 
     static synchronized void submit() {
-        if (ON && submits++ < 400) {
+        if (ON && (submits++ < 400 || submits % 50 == 0)) {
             System.out.println("[horizon-wgpu] java " + submits + ": " + COUNTS);
             COUNTS.clear();
         }

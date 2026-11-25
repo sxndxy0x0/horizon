@@ -24,7 +24,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalDouble;
-import java.util.OptionalLong;
 import java.util.Set;
 import java.util.function.BooleanSupplier;
 import java.util.function.Supplier;
@@ -48,13 +47,16 @@ final class WgpuDevice implements GpuDeviceBackend {
     final MemorySegment device;
     final WgpuEncoder encoder;
     private final Map<String, String> info = new HashMap<>();
+    /** See {@link #calibrate}. */
+    private final long calibration;
 
-    WgpuDevice() {
+    /** @param probe a window like the game's (see {@link WgpuBackend#createDevice}), or NULL */
+    WgpuDevice(MemorySegment probe) {
         String[] names = Arrays.stream(GpuFormat.values()).map(Enum::name).toArray(String[]::new);
         if (!Arrays.equals(names, FORMATS)) {
             throw new IllegalStateException("GpuFormat changed: " + Arrays.toString(names));
         }
-        this.ctx = Native.create();
+        this.ctx = Native.create(probe);
         if (ctx.equals(MemorySegment.NULL)) {
             throw new IllegalStateException("no wgpu device");
         }
@@ -66,7 +68,26 @@ final class WgpuDevice implements GpuDeviceBackend {
         }
         System.out.println("[horizon-wgpu] device: " + info);
         this.device = Native.device(ctx);
+        Native.current = ctx;
         this.encoder = new WgpuEncoder(this);
+        this.calibration = calibrate();
+    }
+
+    /** The GPU's timestamp clock less {@link System#nanoTime} (as the OpenGL backend has it), measured once: a
+     * timestamp written and waited for, against the time the wait returned (late by the wait's own latency). */
+    private long calibrate() {
+        WgpuQueryPool pool = new WgpuQueryPool(this, 1);
+        try {
+            if (pool.handle.equals(MemorySegment.NULL)) {
+                return 0;
+            }
+            pool.write(0);
+            Native.await(ctx, Native.submit(ctx), 5_000_000_000L);
+            long cpu = System.nanoTime();
+            return pool.getValue(0).orElse(cpu) - cpu;
+        } finally {
+            pool.close();
+        }
     }
 
     private int intInfo(String key, int fallback) {
@@ -79,16 +100,14 @@ final class WgpuDevice implements GpuDeviceBackend {
 
     @Override
     public GpuSurfaceBackend createSurface(long window, BooleanSupplier isIconified) {
-        int props = SDLVideo.SDL_GetWindowProperties(window);
-        long hwnd = SDLProperties.SDL_GetPointerProperty(props, SDLVideo.SDL_PROP_WINDOW_WIN32_HWND_POINTER, 0L);
-        long instance = SDLProperties.SDL_GetPointerProperty(props, SDLVideo.SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER,
-                0L);
-        System.out.println("[horizon-wgpu] window " + Long.toHexString(window) + ": hwnd " + Long.toHexString(hwnd)
-                + ", hinstance " + Long.toHexString(instance));
-        if (hwnd == 0L) {
-            throw new IllegalStateException("the window has no Win32 handle (this backend runs on Windows for now)");
+        MemorySegment s;
+        try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
+            MemorySegment target = WindowTarget.of(window, arena);
+            if (target.equals(MemorySegment.NULL)) {
+                throw new IllegalStateException("SDL gives no window handle this backend knows");
+            }
+            s = Native.surfaceCreate(ctx, target);
         }
-        MemorySegment s = Native.surfaceCreate(ctx, hwnd, instance);
         if (s.equals(MemorySegment.NULL)) {
             throw new IllegalStateException("surface: " + Native.error(ctx));
         }
@@ -125,6 +144,7 @@ final class WgpuDevice implements GpuDeviceBackend {
     @Override
     public GpuBuffer createBuffer(Supplier<String> label, int usage, ByteBuffer data) {
         WgpuBuffer b = new WgpuBuffer(this, usage, data.remaining(), false);
+        b.written(0, data);
         Native.bufferWrite(ctx, b.handle, 0, data);
         return b;
     }
@@ -153,32 +173,12 @@ final class WgpuDevice implements GpuDeviceBackend {
 
     @Override
     public GpuQueryPool createTimestampQueryPool(int size) {
-        return new GpuQueryPool() {
-            @Override
-            public int size() {
-                return size;
-            }
-
-            @Override
-            public OptionalLong getValue(int index) {
-                return OptionalLong.empty();
-            }
-
-            @Override
-            public OptionalLong[] getValues(int index, int count) {
-                OptionalLong[] out = new OptionalLong[count];
-                Arrays.fill(out, OptionalLong.empty());
-                return out;
-            }
-
-            @Override
-            public void close() {}
-        };
+        return new WgpuQueryPool(this, size);
     }
 
     @Override
     public long getTimestampCalibrationOffset() {
-        return 0;
+        return calibration;
     }
 
     @Override
@@ -197,14 +197,16 @@ final class WgpuDevice implements GpuDeviceBackend {
         } catch (NumberFormatException e) {
             maxBuffer = 1L << 28;
         }
+        // Multi-draw as the game's Vulkan backend has it (draws interleaved in one array: Rust records them in one
+        // call); indirect draws when wgpu has first instances in them (the game's indirect terrain needs those).
+        // Instances may start past zero. Wireframe when the GPU draws lines from triangles (POLYGON_MODE_LINE).
+        boolean indirect = "true".equals(info.get("indirect"));
         DeviceLimits limits = new DeviceLimits(16, intInfo("min_uniform_align", 256), intInfo("max_texture", 8192),
-                maxBuffer, 0, intInfo("max_colors", 8), 0);
-        // No multi-draw or indirect draws: the frontend draws one by one. Instances may start past zero. Wireframe
-        // when the GPU draws lines from triangles (wgpu's POLYGON_MODE_LINE).
+                maxBuffer, 1 << 16, intInfo("max_colors", 8), indirect ? 1 << 24 : 0);
         boolean wireframe = "true".equals(info.get("wireframe"));
-        DeviceFeatures features = new DeviceFeatures(wireframe, false, false, false, false, false, true, false);
+        DeviceFeatures features = new DeviceFeatures(wireframe, false, true, false, indirect, indirect, true, false);
         return new DeviceInfo(info.getOrDefault("name", "wgpu"), info.getOrDefault("vendor", ""),
                 info.getOrDefault("driver", ""), true, "Horizon wgpu (" + info.getOrDefault("backend", "?") + ")",
-                1.0f, limits, features, Set.of(), new HintsAndWorkarounds(false, false, false, true), deviceType);
+                1.0f, limits, features, Set.of(), new HintsAndWorkarounds(false, false, false, false), deviceType);
     }
 }

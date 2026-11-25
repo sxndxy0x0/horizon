@@ -10,6 +10,12 @@
 //! 4. An output array (`out vec4 coeff[3]` at location 0: the game's order-independent transparency writes one
 //!    element per color target) becomes one output per element, at locations 0, 1, 2: WebGPU has no array
 //!    inputs or outputs.
+//! 5. A pointer parameter a function only reads (naga's SPIR-V reader makes every GLSL `in` parameter one, the
+//!    caller passing a pointer to a local copy) becomes a value parameter. On wgpu's Vulkan path a function that
+//!    passes a pointer to its own local on to another function read zeros through it: the game's fog functions
+//!    came out black. Values are what GLSL meant anyway.
+
+use std::collections::HashMap;
 
 use naga::{Expression, Handle, Module, Span, Statement, TypeInner};
 
@@ -59,6 +65,25 @@ pub fn parse(
         flip_y(&mut module)?;
     }
     flatten_output_arrays(&mut module)?;
+    by_value_arguments(&mut module);
+    Ok(Parsed {
+        resources: resources(&module)?,
+        module,
+    })
+}
+
+/// Debugging (`HZ_WGPU_OVERRIDE=folder`): a pipeline's shader from a WGSL file there (named as `HZ_WGPU_WGSL`
+/// writes them) in place of the game's, to look at one step of it at a time.
+pub fn from_wgsl(text: &str) -> Result<Parsed, String> {
+    let module = naga::front::wgsl::parse_str(text).map_err(|e| e.emit_to_string(text))?;
+    Ok(Parsed {
+        resources: resources(&module)?,
+        module,
+    })
+}
+
+/// Each resource the module declares: (group, binding, kind).
+fn resources(module: &Module) -> Result<Vec<(u32, u32, Resource)>, String> {
     let mut resources = Vec::new();
     for (_, global) in module.global_variables.iter() {
         let Some(binding) = &global.binding else {
@@ -103,7 +128,7 @@ pub fn parse(
         };
         resources.push((binding.group, binding.binding, kind));
     }
-    Ok(Parsed { module, resources })
+    Ok(resources)
 }
 
 /// Negates `y` of the position each vertex entry point returns (see the module docs).
@@ -385,4 +410,237 @@ fn flatten_output_arrays(module: &mut Module) -> Result<(), String> {
 
 fn is_position(b: &naga::Binding) -> bool {
     matches!(b, naga::Binding::BuiltIn(naga::BuiltIn::Position { .. }))
+}
+
+/// GLSL `in` parameters by value (see the module docs, step 5): each pointer parameter a function only reads
+/// becomes a value parameter, copied into a local at the function's start (the body keeps using that local as it
+/// used the pointer), and each call passes the loaded value. Parameters a function writes, or hands on to a call
+/// that may write them, stay pointers.
+fn by_value_arguments(module: &mut Module) {
+    use naga::{Expression as E, Statement as S};
+
+    /// The expression a pointer expression is derived from (through access chains).
+    fn root(exprs: &naga::Arena<E>, mut h: Handle<E>) -> Handle<E> {
+        loop {
+            match exprs[h] {
+                E::AccessIndex { base, .. } | E::Access { base, .. } => h = base,
+                _ => return h,
+            }
+        }
+    }
+    /// Every Store pointer and every call (function, its arguments) in a block, nested blocks included.
+    fn walk(
+        block: &naga::Block,
+        stores: &mut Vec<Handle<E>>,
+        calls: &mut Vec<(Handle<naga::Function>, Vec<Handle<E>>)>,
+    ) {
+        for stmt in block.iter() {
+            match stmt {
+                S::Store { pointer, .. } => stores.push(*pointer),
+                S::Call {
+                    function,
+                    arguments,
+                    ..
+                } => calls.push((*function, arguments.clone())),
+                S::Block(b) => walk(b, stores, calls),
+                S::If { accept, reject, .. } => {
+                    walk(accept, stores, calls);
+                    walk(reject, stores, calls);
+                }
+                S::Loop {
+                    body, continuing, ..
+                } => {
+                    walk(body, stores, calls);
+                    walk(continuing, stores, calls);
+                }
+                S::Switch { cases, .. } => {
+                    for c in cases {
+                        walk(&c.body, stores, calls);
+                    }
+                }
+                S::Atomic { pointer, .. } => stores.push(*pointer),
+                _ => {}
+            }
+        }
+    }
+
+    // Which arguments of which functions are read-only pointers, to a fixed point: an argument handed to a call
+    // stays a pointer unless the callee's parameter is itself read-only.
+    let handles: Vec<Handle<naga::Function>> = module.functions.iter().map(|(h, _)| h).collect();
+    let mut by_value: HashMap<Handle<naga::Function>, Vec<bool>> = HashMap::new();
+    for &h in &handles {
+        let f = &module.functions[h];
+        let flags = f
+            .arguments
+            .iter()
+            .map(|a| {
+                matches!(
+                    module.types[a.ty].inner,
+                    TypeInner::Pointer {
+                        space: naga::AddressSpace::Function,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        by_value.insert(h, flags);
+    }
+    loop {
+        let mut changed = false;
+        for &h in &handles {
+            let f = &module.functions[h];
+            let mut stores = Vec::new();
+            let mut calls = Vec::new();
+            walk(&f.body, &mut stores, &mut calls);
+            let argument_of = |e: Handle<E>| match f.expressions[root(&f.expressions, e)] {
+                E::FunctionArgument(i) => Some(i as usize),
+                _ => None,
+            };
+            let mut written = vec![false; f.arguments.len()];
+            for s in stores {
+                if let Some(i) = argument_of(s) {
+                    written[i] = true;
+                }
+            }
+            for (callee, args) in &calls {
+                for (k, &a) in args.iter().enumerate() {
+                    if let Some(i) = argument_of(a) {
+                        let callee_reads_only = by_value
+                            .get(callee)
+                            .and_then(|v| v.get(k))
+                            .copied()
+                            .unwrap_or(false);
+                        if !callee_reads_only {
+                            written[i] = true;
+                        }
+                    }
+                }
+            }
+            let flags = by_value.get_mut(&h).expect("every function");
+            for (i, w) in written.into_iter().enumerate() {
+                if w && flags[i] {
+                    flags[i] = false;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    // Each function: its read-only pointer arguments become values, copied into locals the body points at.
+    let types = module.types.clone();
+    for &h in &handles {
+        let flags = by_value[&h].clone();
+        if !flags.contains(&true) {
+            continue;
+        }
+        let f = &mut module.functions[h];
+        let mut stores = Vec::new();
+        for (i, &convert) in flags.iter().enumerate() {
+            if !convert {
+                continue;
+            }
+            let TypeInner::Pointer { base, .. } = types[f.arguments[i].ty].inner else {
+                continue;
+            };
+            f.arguments[i].ty = base;
+            let local = f.local_variables.append(
+                naga::LocalVariable {
+                    name: f.arguments[i].name.as_ref().map(|n| format!("{n}_in")),
+                    ty: base,
+                    init: None,
+                },
+                Span::UNDEFINED,
+            );
+            // Where the body named the pointer argument, it now names the local.
+            let pointers: Vec<Handle<E>> = f
+                .expressions
+                .iter()
+                .filter(|(_, e)| matches!(e, E::FunctionArgument(k) if *k as usize == i))
+                .map(|(eh, _)| eh)
+                .collect();
+            for &p in &pointers {
+                f.expressions[p] = E::LocalVariable(local);
+            }
+            let value = f
+                .expressions
+                .append(E::FunctionArgument(i as u32), Span::UNDEFINED);
+            let pointer = match pointers.first() {
+                Some(&p) => p,
+                None => f
+                    .expressions
+                    .append(E::LocalVariable(local), Span::UNDEFINED),
+            };
+            stores.push(S::Store { pointer, value });
+        }
+        let mut body = std::mem::take(&mut f.body);
+        let mut out = naga::Block::with_capacity(body.len() + stores.len());
+        for s in stores {
+            out.push(s, Span::UNDEFINED);
+        }
+        out.append(&mut body);
+        f.body = out;
+    }
+
+    // Each call passes a loaded value where its callee now takes one.
+    fn rewrite(
+        block: &mut naga::Block,
+        exprs: &mut naga::Arena<E>,
+        by_value: &HashMap<Handle<naga::Function>, Vec<bool>>,
+    ) {
+        let old = std::mem::take(block);
+        let mut out = naga::Block::with_capacity(old.len());
+        for (mut stmt, span) in old.span_into_iter() {
+            match &mut stmt {
+                S::Call {
+                    function,
+                    arguments,
+                    ..
+                } => {
+                    if let Some(flags) = by_value.get(function) {
+                        for (k, a) in arguments.iter_mut().enumerate() {
+                            if flags.get(k).copied().unwrap_or(false) {
+                                let load = exprs.append(E::Load { pointer: *a }, Span::UNDEFINED);
+                                out.push(S::Emit(naga::Range::new_from_bounds(load, load)), span);
+                                *a = load;
+                            }
+                        }
+                    }
+                }
+                S::Block(b) => rewrite(b, exprs, by_value),
+                S::If { accept, reject, .. } => {
+                    rewrite(accept, exprs, by_value);
+                    rewrite(reject, exprs, by_value);
+                }
+                S::Loop {
+                    body, continuing, ..
+                } => {
+                    rewrite(body, exprs, by_value);
+                    rewrite(continuing, exprs, by_value);
+                }
+                S::Switch { cases, .. } => {
+                    for c in cases.iter_mut() {
+                        rewrite(&mut c.body, exprs, by_value);
+                    }
+                }
+                _ => {}
+            }
+            out.push(stmt, span);
+        }
+        *block = out;
+    }
+    for &h in &handles {
+        let f = &mut module.functions[h];
+        let mut body = std::mem::take(&mut f.body);
+        rewrite(&mut body, &mut f.expressions, &by_value);
+        f.body = body;
+    }
+    for ep in module.entry_points.iter_mut() {
+        let f = &mut ep.function;
+        let mut body = std::mem::take(&mut f.body);
+        rewrite(&mut body, &mut f.expressions, &by_value);
+        f.body = body;
+    }
 }

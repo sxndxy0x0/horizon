@@ -18,6 +18,9 @@ final class WgpuBuffer extends BaseGpuBuffer {
     final MemorySegment handle;
     private final boolean transientBlock;
     private MemorySegment shadow;
+    /** An index buffer's CPU copy holds what the GPU has (no GPU copy wrote into it since): a triangle fan drawn
+     * through it is turned into a triangle list from it (see {@link WgpuRenderPass#drawIndexed}). */
+    private boolean indexCopy;
     private boolean closed;
 
     WgpuBuffer(WgpuDevice device, int usage, long size, boolean transientBlock) {
@@ -30,9 +33,32 @@ final class WgpuBuffer extends BaseGpuBuffer {
         if (handle.equals(MemorySegment.NULL)) {
             throw new IllegalStateException("buffer: " + Native.error(device.ctx));
         }
-        if (mappable) {
+        indexCopy = (usage & GpuBuffer.USAGE_INDEX) != 0;
+        if (mappable || indexCopy) {
             shadow = Arena.ofAuto().allocate(Math.max(16, (size + 15) & ~15L), 16);
         }
+    }
+
+    /** The game wrote {@code data} at {@code offset} (it goes to the GPU too): the CPU copy follows. */
+    void written(long offset, ByteBuffer data) {
+        if (shadow != null) {
+            MemorySegment.copy(MemorySegment.ofBuffer(data), 0, shadow, offset, data.remaining());
+        }
+    }
+
+    /** A GPU copy wrote into the buffer: its CPU copy no longer follows (until a read mapping fills it). */
+    void gpuWritten() {
+        indexCopy = false;
+    }
+
+    /** The CPU copy as it is, or null when there is none (for a fan's indirect draws: see WgpuRenderPass). */
+    MemorySegment cpuCopy() {
+        return shadow;
+    }
+
+    /** This index buffer's indices as the GPU has them, or null when there is no such copy. */
+    MemorySegment indexCopy() {
+        return indexCopy ? shadow : null;
     }
 
     /** The CPU copy from {@code offset} for {@code length} bytes, as a little-endian buffer the game writes. */

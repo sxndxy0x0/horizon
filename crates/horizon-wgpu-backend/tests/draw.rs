@@ -26,8 +26,29 @@ const RGBA8_UNORM: u32 = 6;
 const RG32_FLOAT: i32 = 45;
 
 /// Draws one red triangle (clip-space x, y) over a blue 64x64 texture; the texture's bytes, rows as stored.
+const PASS_COLOR: &str =
+    "@fragment fn main(@location(0) c: vec4<f32>) -> @location(0) vec4<f32> { return c; }";
+
 fn draw(triangle: [(f32, f32); 3], cull: bool) -> Option<Vec<u8>> {
-    let ctx = hz_create();
+    draw_with(triangle, cull, PASS_COLOR)
+}
+
+/// [`draw`] with a fragment shader of its own (WGSL; it gets the vertex color at location 0).
+fn draw_with(triangle: [(f32, f32); 3], cull: bool, fragment: &str) -> Option<Vec<u8>> {
+    draw_shape(&triangle, 4, None, cull, fragment)
+}
+
+/// Red vertices drawn as the game's `topology` (its ordinal), through `fan_indices` (an indexed triangle fan from
+/// Java's copy of the index buffer) when given.
+fn draw_shape(
+    points: &[(f32, f32)],
+    topology: i32,
+    fan_indices: Option<&[u16]>,
+    cull: bool,
+    fragment: &str,
+) -> Option<Vec<u8>> {
+    // SAFETY: no probe window: the first adapter.
+    let ctx = unsafe { hz_create(ptr::null()) };
     if ctx.is_null() {
         eprintln!("no GPU: skipped");
         return None;
@@ -40,12 +61,10 @@ fn draw(triangle: [(f32, f32); 3], cull: bool) -> Option<Vec<u8>> {
              return O(vec4(p + u.offset.xy, 0.5, 1.0), c);
          }",
     );
-    let fs = spirv(
-        "@fragment fn main(@location(0) c: vec4<f32>) -> @location(0) vec4<f32> { return c; }",
-    );
+    let fs = spirv(fragment);
     #[rustfmt::skip]
     let desc: Vec<i32> = vec![
-        0, 0, 0, i32::from(cull), 4, 0,                    // no immediates, depth always, no write, cull?, triangles
+        0, 0, 0, i32::from(cull), topology, 0,             // no immediates, depth always, no write, cull?, topology
         1, 0, 12, 0,                                       // one buffer: slot 0, 12 bytes a vertex, per vertex
         2, 0, 0, 0, RG32_FLOAT, 0, 1, 8, RGBA8_UNORM as i32, // position, color
         1, 1, 0, 0, 0, 0, 0, 0, 0, 15,                     // one target: used, no blend, write all
@@ -78,7 +97,7 @@ fn draw(triangle: [(f32, f32); 3], cull: bool) -> Option<Vec<u8>> {
         hz_buffer_write(ctx, uniform, 0, offset.as_ptr().cast(), 16);
         // A red triangle over the top of clip space: y from 0.2 to 1.
         let mut vertices = Vec::new();
-        for (x, y) in triangle {
+        for &(x, y) in points {
             vertices.extend(x.to_le_bytes());
             vertices.extend(y.to_le_bytes());
             vertices.extend([255u8, 0, 0, 255]);
@@ -109,7 +128,26 @@ fn draw(triangle: [(f32, f32); 3], cull: bool) -> Option<Vec<u8>> {
         hz_pass_pipeline(ctx, pipeline);
         hz_pass_buffer(ctx, 0, uniform, 0, 256);
         hz_pass_vertex(ctx, 0, vbuf, 0, vertices.len() as u64);
-        hz_pass_draw(ctx, 3, 1, 0, 0);
+        match fan_indices {
+            Some(indices) => {
+                let bytes: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
+                let ibuf = hz_buffer_create(ctx, bytes.len() as u64, 64 | 8);
+                hz_buffer_write(ctx, ibuf, 0, bytes.as_ptr(), bytes.len() as u64);
+                hz_pass_index(ctx, ibuf, 0);
+                hz_pass_draw_fan_indexed(
+                    ctx,
+                    bytes.as_ptr(),
+                    bytes.len() as u64,
+                    0,
+                    indices.len() as u32,
+                    1,
+                    0,
+                    0,
+                    0,
+                );
+            }
+            None => hz_pass_draw(ctx, points.len() as u32, 1, 0, 0),
+        }
         hz_pass_end(ctx);
 
         let read = hz_buffer_create(ctx, 64 * 64 * 4, 1 | 8);
@@ -167,4 +205,121 @@ fn culling_keeps_the_game_front_faces() {
         return;
     };
     assert_eq!(pixel(&back, 32, 20), BLUE, "a clockwise triangle is culled");
+}
+
+/// The game's fog functions, in the shape naga's SPIR-V reader gives them (each argument a pointer to a local the
+/// caller fills, an early return in an `if`/`else`): a red triangle near the camera, with no fog to speak of, stays
+/// red. On wgpu's Vulkan path this came out black in the game, while the same math written inline did not.
+#[test]
+fn nested_fog_functions_keep_the_color() {
+    let fragment = "
+        fn linear_fog_value(vertexDistance: ptr<function, f32>, fogStart: ptr<function, f32>, fogEnd: ptr<function, f32>) -> f32 {
+            let d = (*vertexDistance);
+            let s = (*fogStart);
+            if (d <= s) {
+                return 0f;
+            } else {
+                let d2 = (*vertexDistance);
+                let e = (*fogEnd);
+                if (d2 >= e) {
+                    return 1f;
+                }
+            }
+            let d3 = (*vertexDistance);
+            let s3 = (*fogStart);
+            let e3 = (*fogEnd);
+            let s4 = (*fogStart);
+            return ((d3 - s3) / (e3 - s4));
+        }
+        fn total_fog_value(sph: ptr<function, f32>, cyl: ptr<function, f32>, es: ptr<function, f32>, ee: ptr<function, f32>, rs: ptr<function, f32>, re: ptr<function, f32>) -> f32 {
+            var p0: f32; var p1: f32; var p2: f32; var p3: f32; var p4: f32; var p5: f32;
+            p0 = (*sph); p1 = (*es); p2 = (*ee);
+            let a = linear_fog_value((&p0), (&p1), (&p2));
+            p3 = (*cyl); p4 = (*rs); p5 = (*re);
+            let b = linear_fog_value((&p3), (&p4), (&p5));
+            return max(a, b);
+        }
+        fn apply_fog(inColor: ptr<function, vec4<f32>>, sph: ptr<function, f32>, cyl: ptr<function, f32>, es: ptr<function, f32>, ee: ptr<function, f32>, rs: ptr<function, f32>, re: ptr<function, f32>, fogColor: ptr<function, vec4<f32>>) -> vec4<f32> {
+            var fogValue: f32;
+            var p6: f32; var p7: f32; var p8: f32; var p9: f32; var p10: f32; var p11: f32;
+            p6 = (*sph); p7 = (*cyl); p8 = (*es); p9 = (*ee); p10 = (*rs); p11 = (*re);
+            let v = total_fog_value((&p6), (&p7), (&p8), (&p9), (&p10), (&p11));
+            fogValue = v;
+            let c = (*inColor);
+            let f = (*fogColor);
+            let m = mix(c.xyz, f.xyz, vec3((fogValue * (*fogColor)[3u])));
+            return vec4<f32>(m.x, m.y, m.z, (*inColor)[3u]);
+        }
+        fn calculate(color: ptr<function, vec4<f32>>, distance: f32) -> vec4<f32> {
+            var fc: vec4<f32>;
+            var q0: vec4<f32>; var q1: f32; var q2: f32; var q3: f32; var q4: f32; var q5: f32; var q6: f32; var q7: vec4<f32>;
+            fc = vec4<f32>(0.0, 0.0, 1.0, 1.0);
+            q0 = (*color); q1 = distance; q2 = distance; q3 = 0.0; q4 = 1024.0; q5 = 57.6; q6 = 64.0; q7 = fc;
+            return apply_fog((&q0), (&q1), (&q2), (&q3), (&q4), (&q5), (&q6), (&q7));
+        }
+        @fragment fn main(@location(0) c: vec4<f32>) -> @location(0) vec4<f32> {
+            var color: vec4<f32>;
+            color = c;
+            return calculate((&color), c.r * 0.5);
+        }";
+    let Some(out) = draw_with([(-1.0, -1.0), (3.0, -1.0), (-1.0, 3.0)], false, fragment) else {
+        return;
+    };
+    let p = pixel(&out, 32, 32);
+    assert!(
+        p[0] > 250 && p[2] < 5,
+        "the color, fogged by 0.5/1024 at most: {p:?}"
+    );
+}
+
+/// A triangle fan (the game draws its sky discs and the sunrise glow as fans; wgpu has none): a square of four
+/// vertices covers the whole target, both triangles of it, drawn straight and through an index buffer.
+#[test]
+fn triangle_fans_draw_every_triangle() {
+    let square = [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)];
+    for indices in [None, Some(&[3u16, 0, 1, 2][..])] {
+        let Some(out) = draw_shape(&square, 6, indices, false, PASS_COLOR) else {
+            return;
+        };
+        for (x, y) in [(4, 4), (60, 4), (4, 60), (60, 60)] {
+            let p = pixel(&out, x, y);
+            assert!(
+                p[0] > 250 && p[2] < 5,
+                "({x}, {y}) of the fan, indexed {}: {p:?}",
+                indices.is_some()
+            );
+        }
+    }
+}
+
+/// Timestamps (the game's GPU timings): two written around some work read back in order, in nanoseconds, once
+/// the GPU is done; one never written reads as none.
+#[test]
+fn timestamps_read_back_in_order() {
+    // SAFETY: no probe window: the first adapter.
+    let ctx = unsafe { hz_create(ptr::null()) };
+    if ctx.is_null() {
+        eprintln!("no GPU: skipped");
+        return;
+    }
+    // SAFETY: every pointer below is live for its call.
+    unsafe {
+        let pool = hz_timestamps_create(ctx, 3);
+        if pool.is_null() {
+            eprintln!("no timestamp queries: skipped");
+            return;
+        }
+        hz_timestamp_write(ctx, pool, 0);
+        let tex = hz_texture_create(ctx, RGBA8_UNORM, 1 | 2 | 4 | 8, 256, 256, 1, 1);
+        let blue = [0.0f32, 0.0, 1.0, 1.0];
+        hz_clear(ctx, tex, blue.as_ptr(), ptr::null_mut(), 1.0, 0, 0, 0, 0, 0);
+        hz_timestamp_write(ctx, pool, 1);
+        let serial = hz_submit(ctx);
+        assert_eq!(hz_wait(ctx, serial, -1), 1);
+        let mut out = [0i64; 3];
+        hz_timestamps_read(ctx, pool, 0, 3, out.as_mut_ptr());
+        assert!(out[0] >= 0 && out[1] >= out[0], "timestamps {out:?}");
+        assert_eq!(out[2], -1, "the unwritten one");
+        hz_timestamps_free(pool);
+    }
 }

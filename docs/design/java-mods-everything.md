@@ -107,7 +107,7 @@
 
 1. ✅ **P1 Agent + diff ของ bytecode:** บูต Fabric 26.3 และ NeoForge 26.3 จริงพร้อมม็อดตัวอย่างใน JVM ธรรมดา แล้วให้ agent ออกรายงานว่าม็อดแตะ method ไหน ยังไม่ต้องใช้ Horizon เครื่องนี้มี Fabric 26.3 อยู่แล้ว
 2. ✅ **P2 หน่วยความจำร่วม:** บล็อก แสง และ heightmap ของเกม Java ตัวจริงอยู่บนหน่วยความจำของ Rust โลกจริงที่แก้แล้วให้แสงแล้วเซฟออกมาตรงกับ vanilla ทุก chunk และ `LevelAccess` ของ Horizon อ่านเขียนโลกที่กำลังรันอยู่ได้ตรง
-3. ✅ **P3 วาดภาพ:** หน้า title ของ Java client จริงวาดผ่าน backend wgpu ของ Horizon ภาพเหมือน OpenGL เกือบทุก pixel และเร็วเท่ากัน
+3. ✅ **P3 วาดภาพ:** Java client จริงวาดผ่าน backend wgpu ของ Horizon ทั้งหน้า title (ตรง OpenGL ทุก pixel) และในโลก (ต่างจาก OpenGL น้อยกว่าที่ Vulkan ของ Mojang ต่าง)
 4. **P4 accelerator ตัวแรก:** ระบบไฟ เปิดเมื่อแผนบอกว่าปลอดภัย และผ่าน parity harness เดิม
 
 ## ผล P1 (2026-11-25)
@@ -277,7 +277,8 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
   - `WgpuBackend` เป็น backend ตัวที่สามของเกม คู่กับ OpenGL และ Vulkan ของ Mojang
   - ชั้น frontend ของ renderpearl (ตรวจความถูกต้อง, คอมไพล์ GLSL เป็น SPIR-V) ทำงานตามเดิม เราเขียนเฉพาะชั้น backend 4 interface คือ `GpuDeviceBackend`, `CommandEncoderBackend`, `RenderPassBackend` และ `GpuSurfaceBackend`
   - Agent เปลี่ยน `PreferredGraphicsApi.getBackendsToTry` ให้คืน backend ที่เลือกผ่าน `-Dhz.render=wgpu|opengl|vulkan`
-- **ฝั่ง Rust:** crate `crates/horizon-wgpu-backend` (cdylib) เรียกผ่าน FFM ใช้ wgpu 30 ตัวเดียวกับที่ Horizon ใช้ บน Windows ใช้ DX12 (`HZ_WGPU_BACKEND=vulkan` เพื่อเลือก Vulkan)
+- **ฝั่ง Rust:** crate `crates/horizon-wgpu-backend` (cdylib) เรียกผ่าน FFM ใช้ wgpu 30 ตัวเดียวกับที่ Horizon ใช้
+  - เลือก API ตัวแรกที่วาดลงหน้าต่างแบบเดียวกับของเกมได้ เรียงเป็น Vulkan, DX12, Metal, GL (`HZ_WGPU_BACKEND=vulkan|dx12|metal|gl` บังคับได้)
 - **วิธีทดสอบ:**
   - เปิด client จริงในโฟลเดอร์เกมชั่วคราว (ไม่แตะเซฟหรือ options ของผู้เล่น) จนหน้า title วาดไปแล้ว 120 เฟรม
   - ให้โค้ด screenshot ของเกมเองอ่านเฟรมกลับมา (ทดสอบเส้นทางอ่านข้อมูลจาก GPU ไปด้วย) แล้วเทียบทีละ pixel
@@ -323,14 +324,71 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
 - **Vulkan ของ wgpu บอกว่าไม่รองรับ surface ของหน้าต่าง Win32 บนไดรเวอร์ AMD เครื่องนี้:** จึงใช้ DX12 แทน
 - **เครื่องมือดีบัก:** `HZ_WGPU_TRACE=1` (นับคำสั่งต่อเฟรม), `HZ_WGPU_DUMP=ไฟล์.ppm` กับ `HZ_WGPU_DUMP_FRAME` (บันทึกเฟรมที่ส่งขึ้นจอ)
 
+### รอบที่สอง (2026-11-26): ของที่เหลือจากรอบแรก
+
+ตัวทดลอง: `python tools/wgpu_backend_probe.py --world <โลกที่ P2 สร้าง> [--uncapped]`
+
+- **ในโลก:** เปิดโลกที่ P2 สร้าง ตรึงกล้อง (`--view`) ตั้งเวลาเป็น 1000 หยุดนาฬิกา (`advance_time false`) และแช่ server
+  - จับภาพหลังผ่านไปอย่างน้อย 600 เฟรม **และ** 30 วินาที (`--hold`) เพราะสีท้องฟ้าและหมอกค่อย ๆ ผสมตามเวลาจริง ไม่ใช่ตามจำนวนเฟรม
+  - ถ้านับแค่เฟรม รอบที่ fps ต่างกันจะจับภาพกันคนละช่วงเวลา: OpenGL เทียบกับ OpenGL รอบอื่นยังต่างถึง 5.1
+- **ผล (Vulkan ของ wgpu, ต่างเฉลี่ยต่อ channel จาก 255):**
+
+| ภาพ | wgpu เทียบ OpenGL | Vulkan ของ Mojang เทียบ OpenGL |
+|---|---|---|
+| หน้า title | ตรงทุก pixel | ตรงทุก pixel |
+| ในโลก | 0.026 (pixel ต่างเกิน 16 มี 1 จุด) | 0.060 (pixel ต่างเกิน 16 มี 1 จุด) |
+
+- **ความเร็ว (`--uncapped`: ปิด vsync และไม่จำกัด fps, ในโลก):**
+
+| backend | ms ต่อเฟรม |
+|---|---:|
+| OpenGL (Mojang) | 3.8–4.2 |
+| Vulkan (Mojang) | 5.5 |
+| wgpu ก่อนรอบนี้ | 10.6 |
+| **wgpu ตอนนี้** | **6.0–6.8** |
+
+#### ที่แก้
+
+- **พื้นโลกดำบน Vulkan (DX12 ไม่เป็น):**
+  - naga รับ parameter `in` ของ GLSL เป็น pointer ไปยังสำเนา local
+  - บน Vulkan ฟังก์ชันที่ส่ง pointer ของ local ตัวเองต่อให้อีกฟังก์ชันจะอ่านได้ศูนย์ ทำให้ฟังก์ชันหมอก (fog) ของเกมคืนสีดำ
+  - `shader.rs` (ขั้น 5) จึงเปลี่ยน pointer parameter ที่ฟังก์ชันแค่อ่าน ให้เป็นการส่งค่าตรง ๆ ซึ่งตรงกับความหมายของ GLSL อยู่แล้ว
+  - มี test `nested_fog_functions_keep_the_color` ครอบไว้
+- **แสงพระอาทิตย์ขึ้นหายไป (ตอนแรกนึกว่าเป็นเมฆ):**
+  - เกมวาดแสงนี้และจานท้องฟ้าเป็น triangle fan ซึ่ง wgpu ไม่มี
+  - fan ที่ไม่มี index วาดผ่าน index list ที่ทำไว้ครั้งเดียว
+  - fan ที่มี index ทำ list จากสำเนา CPU ของ index buffer (เก็บสำเนาของทุก buffer ที่ใช้เป็น index)
+  - มี test `triangle_fans_draw_every_triangle` ครอบไว้
+  - ส่วนเมฆวาดตรงอยู่แล้ว
+- **ขอบโลโก้:** บน Vulkan ตรง OpenGL ทุก pixel ความต่างที่เห็นในรอบแรกมาจาก DX12
+- **ความเร็ว:**
+  - เก็บ bind group ไว้ใช้ซ้ำ และให้ uniform กับ storage buffer ใช้ dynamic offset: section ของ terrain ผูก buffer เดิมที่ offset ใหม่ทุก draw จึงใช้ bind group เดียวกันได้
+  - การเขียนใช้ `StagingBelt` ของ wgpu แทนการสร้าง staging buffer ใหม่ทุกครั้ง
+  - fence ไม่ submit ทันที: fence หมายถึง submit ถัดไป และจะ submit ก่อนกำหนดเฉพาะเมื่อมีคนรอจริง เกมสร้าง fence หลายตัวต่อเฟรม และ pool ของเกมถามแบบไม่รอทุกเฟรม
+- **multi-draw และ indirect draw:**
+  - รายงานรองรับเหมือน Vulkan ของ Mojang: multi-draw แบบ interleaved ส่งไป Rust ในครั้งเดียว ส่วน indirect ใช้ `multi_draw_indexed_indirect` ของ wgpu เมื่อมี `INDIRECT_FIRST_INSTANCE`
+  - terrain ของเกมจึงเปลี่ยนไปใช้ทาง indirect เอง
+  - แบบ separate (ทรงของ OpenGL) แปลงเป็น interleaved ให้
+- **timestamp query:** ใช้ timestamp query ของ wgpu ค่าเป็นนาโนวินาที (period 1 เหมือน OpenGL) อ่านแบบไม่รอ GPU และวัด calibration offset ครั้งเดียวตอนสร้าง device มี test `timestamps_read_back_in_order` ครอบไว้
+- **หน้าต่างนอก Windows:** อ่าน handle ของ X11, Wayland และ Cocoa (`SDL_Metal_CreateView`) จาก SDL แล้ว ยังทดสอบบนเครื่องนี้ไม่ได้ เพราะมีแต่ Windows
+- **เครื่องมือใหม่:**
+  - `--uncapped` และ `--world` ในตัวทดลอง
+  - `-Dhz.jfr=ไฟล์` เก็บ JFR ก่อนเกมปิด (เกมปิดด้วย `halt` จึงไม่มี exit hook)
+  - `HZ_WGPU_WGSL=โฟลเดอร์` เขียน shader ที่แปลงแล้ว
+  - `HZ_WGPU_OVERRIDE=โฟลเดอร์` แทน shader ของ pipeline ด้วย WGSL
+  - `HZ_WGPU_DUMP_ALL` เก็บ texture และผลของแต่ละ pass
+  - `HZ_WGPU_HEADLESS` วาดโดยไม่ขึ้นจอ (ตอนนี้ไม่ต้องให้ API รองรับหน้าต่างด้วย)
+
 ### ที่ยังเหลือ
 
-- **ขอบโลโก้ต่างจาก OpenGL ราว 0.2% ของ pixel:**
-  - backend Vulkan ของ Mojang ตรงกับ OpenGL ทุก pixel บน GPU เดียวกัน จึงไม่ใช่เรื่องที่ API ต่างกันปัดต่างกันเอง
-  - โลโก้ถูกย่อพอดีครึ่งหนึ่ง จุดที่ sample จึงตกบนเส้นแบ่ง texel พอดี และน่าจะปัดไปคนละด้าน (คาดว่าเกิดจากการกลับ y หรือ rasterizer ของ DX12) แต่ยังไม่ได้พิสูจน์
-- **เห็นแค่หน้า title:** เมฆ, OIT และ shader ของโลกคอมไพล์ผ่านทั้งหมด แต่ยังไม่ได้เทียบภาพในโลกจริง
-- **ยังไม่ได้ปรับความเร็ว:** ตอนนี้สร้าง bind group ทุก draw และ staging buffer ทุกครั้งที่เขียน ซึ่งพอสำหรับหน้า title แต่ในโลกจริงควรมี cache และ ring buffer
-- **ยังไม่รองรับ:** timestamp query, multi-draw และ indirect draw (รายงานว่าไม่รองรับ frontend จึงวาดทีละตัวแทน) และใช้ได้เฉพาะ Windows (surface สร้างจาก HWND)
+- **Vulkan ของ wgpu บนไดรเวอร์ AMD เครื่องนี้บางช่วงไม่ยอมรับหน้าต่างของเกม** (`vulkan not compatible with provided surface`):
+  - เกิดเป็นช่วง ๆ และยังไม่รู้สาเหตุ ช่วงที่เจอตลอดคือตอนไม่มีใครใช้เครื่อง (คาดว่าเพราะจอดับ)
+  - ช่วงนั้นจะใช้ DX12 แทน ซึ่งภาพในโลกถูกต้อง แต่ขอบโลโก้ต่าง 0.2% ของ pixel
+  - Vulkan ของ Mojang ขึ้นจอได้ในช่วงเดียวกัน ปัญหาจึงอยู่ที่การเช็ก surface ฝั่ง wgpu
+  - ผลเทียบภาพในรอบนี้ใช้ `HZ_WGPU_BACKEND=vulkan HZ_WGPU_HEADLESS=1`
+  - ตัวเลขความเร็วด้านบนวัดตอนที่ Vulkan ขึ้นจอได้
+- **ยังช้ากว่า Vulkan ของ Mojang ราว 1 ms ต่อเฟรม:** ส่วนใหญ่อยู่ที่ `finish`/`submit` ของ wgpu-core (บันทึกคำสั่งและติดตาม resource) และการ present
+- **หน้าต่างนอก Windows ยังไม่ได้ทดสอบ**
 
 ## เอาอะไรจาก forge/ari มาใช้
 

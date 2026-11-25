@@ -39,11 +39,20 @@ public final class WgpuBackend implements GpuBackend {
 
     @Override
     public GpuDevice createDevice(GpuDebugOptions options) throws BackendCreationException {
-        try {
-            return new FrontendGpuDevice(new WgpuDevice());
+        // The game makes its window after the device. A small hidden window of the same kind lets the device pick
+        // an adapter, and a graphics API, that can present to it.
+        long probe = SDLVideo.SDL_CreateWindow("", 16, 16, SDLVideo.SDL_WINDOW_HIDDEN);
+        try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
+            java.lang.foreign.MemorySegment target = probe == 0L ? java.lang.foreign.MemorySegment.NULL
+                    : WindowTarget.of(probe, arena);
+            return new FrontendGpuDevice(new WgpuDevice(target));
         } catch (RuntimeException e) {
             throw new BackendCreationException("horizon-wgpu-backend: " + e.getMessage(),
                     BackendCreationException.Reason.OTHER);
+        } finally {
+            if (probe != 0L) {
+                SDLVideo.SDL_DestroyWindow(probe);
+            }
         }
     }
 }

@@ -21,6 +21,8 @@ import java.util.List;
 final class WgpuPipeline implements BackendRenderPipeline {
     final String name;
     final MemorySegment handle;
+    /** A triangle fan: wgpu has none, so its draws go as triangle lists. */
+    boolean fan;
     private boolean closed;
     boolean warned;
 
@@ -103,7 +105,9 @@ final class WgpuPipeline implements BackendRenderPipeline {
         if (handle.equals(MemorySegment.NULL)) {
             System.out.println("[horizon-wgpu] pipeline " + info.name() + " refused: " + Native.pipelineError());
         }
-        return new WgpuPipeline(info.name(), handle);
+        WgpuPipeline p = new WgpuPipeline(info.name(), handle);
+        p.fan = info.primitiveTopology() == com.mojang.renderpearl.api.pipeline.PrimitiveTopology.TRIANGLE_FAN;
+        return p;
     }
 
     @Override

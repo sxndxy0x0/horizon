@@ -40,6 +40,18 @@ soundCategory_master:0.0
 realmsNotifications:false
 """
 
+# A world held still for the comparison: a near render distance (the chunks the world was generated with, so no
+# run generates new ones differently) and no pause when the window loses focus.
+WORLD_OPTIONS = """renderDistance:4
+simulationDistance:5
+pauseOnLostFocus:false
+"""
+
+# Frames as fast as the backend draws them (260 is the game's "unlimited").
+UNCAPPED_OPTIONS = """enableVsync:false
+maxFps:260
+"""
+
 
 def rust_library() -> Path:
     subprocess.run(["cargo", "build", "-p", "horizon-wgpu-backend", "--release"], cwd=ROOT, check=True)
@@ -114,7 +126,16 @@ def main() -> int:
     ap.add_argument("--out", type=Path, default=ROOT / ".local" / "wgpu-backend-probe")
     ap.add_argument("--java-home", type=Path)
     ap.add_argument("--backends", default="opengl,wgpu")
-    ap.add_argument("--frames", type=int, default=120)
+    ap.add_argument("--frames", type=int, default=None, help="frames before the capture (120 title, 600 world)")
+    ap.add_argument("--world", type=Path, help="a saved world to open (quick play) and capture instead of the title "
+                    "screen: one shared_memory_probe.py generated, .local/shared-memory-probe/world-generated/"
+                    "universe/gametestworld")
+    ap.add_argument("--view", default="8.5,100,8.5,135,30", help="the camera in the world: x,y,z,yaw,pitch")
+    ap.add_argument("--hold", type=float, default=None,
+                    help="seconds at least between the first frame and the capture (30 in a world, where the sky's "
+                         "colors blend over time; 0 on the title screen)")
+    ap.add_argument("--uncapped", action="store_true",
+                    help="no vsync and no frame cap, so the frame times measure the backend (the frames still compare)")
     args = ap.parse_args()
 
     mc = args.minecraft.resolve()
@@ -142,23 +163,31 @@ def main() -> int:
     index = json.loads(profile.read_text(encoding="utf-8"))["assetIndex"]["id"]
     assets = assets_dir(mc / "assets", index, out)
 
+    frames = args.frames or (600 if args.world else 120)
     results = {}
     for backend in args.backends.split(","):
         game_dir = out / f"game-{backend}"
         shutil.rmtree(game_dir, ignore_errors=True)
         game_dir.mkdir(parents=True)
-        (game_dir / "options.txt").write_text(OPTIONS, encoding="utf-8")
+        (game_dir / "options.txt").write_text(OPTIONS + (WORLD_OPTIONS if args.world else "")
+                                              + (UNCAPPED_OPTIONS if args.uncapped else ""), encoding="utf-8")
+        world_args = []
+        if args.world:
+            shutil.copytree(args.world, game_dir / "saves" / "probe")
+            (game_dir / "saves" / "probe" / "session.lock").unlink(missing_ok=True)
+            world_args = ["--quickPlaySingleplayer", "probe"]
         shot = out / f"{backend}.png"
         shot.unlink(missing_ok=True)
         # The launcher's JVM arguments from the version file that change how native code runs: a larger stack
         # shadow zone (native code past it kills the process without a JVM crash report) and the stack size.
         cmd = [java, "-Xmx2g", "-Xss1M", "-XX:StackShadowPages=32", "--enable-native-access=ALL-UNNAMED", f"-XX:ErrorFile={out / (backend + '-hs_err.log')}", *os.environ.get("HZ_JVM_EXTRA", "").split(), f"-Djava.library.path={natives}",
                f"-javaagent:{jar}", f"-Dhz.render={backend}", f"-Dhz.capture={shot}",
-               f"-Dhz.capture.frames={args.frames}", f"-Dhz.wgpu.lib={lib}", "-Dhz.trace=" + str(bool(os.environ.get('HZ_WGPU_TRACE'))).lower(),
+               f"-Dhz.capture.frames={frames}", f"-Dhz.wgpu.lib={lib}", "-Dhz.capture.world=" + str(bool(args.world)).lower(),
+               f"-Dhz.capture.view={args.view}", "-Dhz.capture.hold=" + str(args.hold if args.hold is not None else (30 if args.world else 0)), "-Dhz.trace=" + str(bool(os.environ.get('HZ_WGPU_TRACE'))).lower(),
                "-cp", os.pathsep.join(map(str, [jar, *cp])), main_class,
                "--gameDir", str(game_dir), "--assetsDir", str(assets), "--assetIndex", index,
                "--version", args.version, "--accessToken", "0", "--username", "Horizon",
-               "--width", "854", "--height", "480"]
+               "--width", "854", "--height", "480", *world_args]
         log_path = out / f"{backend}.log"
         with open(log_path, "w", encoding="utf-8") as log:
             try:
@@ -173,11 +202,11 @@ def main() -> int:
                 k, _, v = line.partition("\t")
                 info[k] = v
         results[backend] = {"ok": ok, "exit": code, "log": str(log_path), **info}
-        print(f"{backend}: {'title screen saved' if ok else f'failed (exit {code}); see {log_path}'}")
+        print(f"{backend}: {'frame saved' if ok else f'failed (exit {code}); see {log_path}'}")
 
     report = ["# P3 report", ""]
     for backend, r in results.items():
-        report.append(f"- {backend}: " + (f"title screen after {r.get('frames')} frames, {r.get('ms per frame')} ms "
+        report.append(f"- {backend}: " + (f"frame after {r.get('frames')} frames, {r.get('ms per frame')} ms "
                                           f"a frame, longest stall {r.get('longest tick gap ms')} ms, {r.get('size')}" if r["ok"] else f"failed, see {r['log']}"))
     ok = all(r["ok"] for r in results.values())
     base = "opengl" if "opengl" in results else None
