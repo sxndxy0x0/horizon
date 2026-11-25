@@ -73,7 +73,7 @@
 
 ### D. การวาดภาพ
 
-- **Java client ตัวจริงรันอยู่:** วาดผ่าน backend ที่ Horizon ทำด้วย wgpu โดยทำตาม interface ของ Blaze3D (ต้องเช็กว่า 26.3 แยกชั้นนี้ไว้ครบแค่ไหน)
+- **Java client ตัวจริงรันอยู่:** วาดผ่าน backend ที่ Horizon ทำด้วย wgpu โดยทำตาม interface backend ของ renderpearl ใน 26.3 (ทำแล้วใน P3)
 - **ส่วนที่ใช้งานหนักเป็น accelerator:** เช่นการทำ mesh ของ chunk และการวาด terrain ถ้าม็อดอย่าง Sodium แตะส่วนนั้น ก็กลับไปใช้ทาง Java ซึ่งยังทำงานได้
 
 ### E. รอยต่อ Rust ↔ Java
@@ -101,13 +101,13 @@
 | ต้องมีเกมของผู้เล่นเอง | เรื่องกฎหมาย ไม่ใช่เทคนิค |
 | แพ็กที่ม็อดแตะทุกชุด | ทำงานได้ครบ แต่ความเร็วใกล้ Java |
 | JVM เอาคลาสออกไม่ได้ | เปลี่ยนม็อดต้องรีสตาร์ท เหมือนเกมจริง |
-| interface วาดภาพของ 26.3 | ต้องพิสูจน์ใน P3 |
+| interface วาดภาพของ 26.3 | พิสูจน์แล้วใน P3 (backend ตัวที่สามเสียบได้จริง) |
 
 ## ลำดับพิสูจน์ (ของเล็กก่อน)
 
 1. ✅ **P1 Agent + diff ของ bytecode:** บูต Fabric 26.3 และ NeoForge 26.3 จริงพร้อมม็อดตัวอย่างใน JVM ธรรมดา แล้วให้ agent ออกรายงานว่าม็อดแตะ method ไหน ยังไม่ต้องใช้ Horizon เครื่องนี้มี Fabric 26.3 อยู่แล้ว
 2. ✅ **P2 หน่วยความจำร่วม:** บล็อก แสง และ heightmap ของเกม Java ตัวจริงอยู่บนหน่วยความจำของ Rust โลกจริงที่แก้แล้วให้แสงแล้วเซฟออกมาตรงกับ vanilla ทุก chunk และ `LevelAccess` ของ Horizon อ่านเขียนโลกที่กำลังรันอยู่ได้ตรง
-3. **P3 วาดภาพ:** หน้า title ของ Java client จริงวาดผ่าน backend wgpu
+3. ✅ **P3 วาดภาพ:** หน้า title ของ Java client จริงวาดผ่าน backend wgpu ของ Horizon ภาพเหมือน OpenGL เกือบทุก pixel และเร็วเท่ากัน
 4. **P4 accelerator ตัวแรก:** ระบบไฟ เปิดเมื่อแผนบอกว่าปลอดภัย และผ่าน parity harness เดิม
 
 ## ผล P1 (2026-11-25)
@@ -268,6 +268,69 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
 - **palette ส่งให้ Rust เป็นสำเนา:** มีไม่เกิน 2^bits id และ Java ขยายได้ทุกเมื่อ ส่วน word ของ storage และแสงไม่มีการคัดลอก
 - **`PalettedContainer` ของ `horizon-core` (คนละตัวกับ `PackedStorage`) ยังถือ word ของตัวเอง:** `JavaLevel` จึงอ่าน section ผ่าน `PackedStorage` ที่ยืม word แทน
 - **การให้ accelerator จริงรันบน thread เจ้าของข้อมูลเป็นงานของ P4 (ระบบไฟ)**
+
+## ผล P3 (2026-11-25): เกม Java ตัวจริงวาดภาพผ่าน wgpu ของ Horizon
+
+ตัวทดลอง: `python tools/wgpu_backend_probe.py --backends opengl,vulkan,wgpu`
+
+- **ฝั่ง Java:** `mods/horizon/src/wgpu-backend/`
+  - `WgpuBackend` เป็น backend ตัวที่สามของเกม คู่กับ OpenGL และ Vulkan ของ Mojang
+  - ชั้น frontend ของ renderpearl (ตรวจความถูกต้อง, คอมไพล์ GLSL เป็น SPIR-V) ทำงานตามเดิม เราเขียนเฉพาะชั้น backend 4 interface คือ `GpuDeviceBackend`, `CommandEncoderBackend`, `RenderPassBackend` และ `GpuSurfaceBackend`
+  - Agent เปลี่ยน `PreferredGraphicsApi.getBackendsToTry` ให้คืน backend ที่เลือกผ่าน `-Dhz.render=wgpu|opengl|vulkan`
+- **ฝั่ง Rust:** crate `crates/horizon-wgpu-backend` (cdylib) เรียกผ่าน FFM ใช้ wgpu 30 ตัวเดียวกับที่ Horizon ใช้ บน Windows ใช้ DX12 (`HZ_WGPU_BACKEND=vulkan` เพื่อเลือก Vulkan)
+- **วิธีทดสอบ:**
+  - เปิด client จริงในโฟลเดอร์เกมชั่วคราว (ไม่แตะเซฟหรือ options ของผู้เล่น) จนหน้า title วาดไปแล้ว 120 เฟรม
+  - ให้โค้ด screenshot ของเกมเองอ่านเฟรมกลับมา (ทดสอบเส้นทางอ่านข้อมูลจาก GPU ไปด้วย) แล้วเทียบทีละ pixel
+  - ตรึงหน้าจอให้นิ่ง: ปิดการหมุนของ panorama (`panoramaScrollSpeed:0`) และเอาข้อความ splash ที่สุ่มออก
+
+### ผล (3 รอบ × 3 backend ผ่านทั้ง 9 ครั้ง, 854×480, AMD Radeon แบบ integrated)
+
+| backend | ms ต่อเฟรม | ค้างนานสุดตอนโหลด | เทียบกับ OpenGL |
+|---|---:|---:|---|
+| OpenGL (Mojang) | 17.2–17.9 | 1.1–1.7 s | — |
+| Vulkan (Mojang) | 16.7–18.0 | 1.3 s | ตรงทุก pixel |
+| **wgpu (Horizon)** | **16.8–17.0** | 2.4–3.5 s | ต่างเฉลี่ย 0.45/255; 0.2% ของ pixel ต่างเกิน 64 ทั้งหมดอยู่ที่ขอบโลโก้ |
+
+- **ความเร็วเท่ากัน:** ทั้งสามตัวถูก vsync จำกัดไว้ที่ราว 60 fps
+- **ค้างตอนโหลดไม่ถึง 5 วินาที:** Windows จึงไม่ขึ้นว่า Not Responding
+- **pipeline ทุกตัวที่เกมสร้างคอมไพล์ผ่าน:** ไม่มีตัวที่ถูกปฏิเสธ ไม่มี validation error และไม่มีฟีเจอร์ที่เกมบอกว่าเครื่องไม่รองรับ (รวม wireframe)
+- **Rust test (`tests/draw.rs`):** วาดสามเหลี่ยมผ่าน API ทั้งเส้นแล้วเช็กว่าลงแถวเดียวกับ backend Vulkan และ culling เก็บหน้าเดียวกัน
+
+### รูปแบบของเกมที่ต้องตามให้ตรง (วิธีทำ)
+
+- **แถวของภาพ:** backend Vulkan ของ Mojang ใช้ viewport ปกติ แถว 0 ของ texture จึงอยู่ที่ clip-space y = -1 (เหมือน OpenGL) แล้วค่อยกลับภาพตอนส่งขึ้นจอ ส่วน wgpu วาง y = +1 ที่แถว 0
+  - `shader.rs` จึงกลับเครื่องหมาย y ของ vertex shader ทุกตัวใน IR ของ naga
+  - ทุก render target, การ copy และการอ่านกลับจึงได้แถวเดียวกับ backend Vulkan
+  - การ blit ขึ้นจอกลับภาพคืน
+  - front face เป็น clockwise เหมือน backend Vulkan (test ยืนยันแล้ว)
+- **sampler รวม (`sampler2D`):** wgpu แยก texture กับ sampler `spirv.rs` จึงแยกใน SPIR-V
+  - texture อยู่ที่ binding เดิม (frontend ใส่ index ของ uniform ไว้ให้) ส่วน sampler อยู่ที่ binding + 64
+  - เกมคอมไพล์แบบไม่ optimize sampler จึงถูกส่งเป็นพารามิเตอร์ของฟังก์ชันด้วย พารามิเตอร์และการเรียกเหล่านี้ได้ sampler คู่กันไป
+- **texel buffer (`isamplerBuffer`, เมฆ):** WebGPU ไม่มี `texel.rs` จึงเปลี่ยนเป็น storage buffer แบบอ่านอย่างเดียว แล้วแปลง `texelFetch` เป็นการอ่าน word, เลื่อน byte และขยาย sign
+- **output แบบ array (`out vec4 coeff[N]`, ระบบโปร่งใส OIT):** WebGPU ไม่มี จึงแยกเป็น N output ที่ location ต่อกัน
+- **uniform block:** เกมผูกแค่ไบต์ที่ใช้ (140 จาก block 144) Vulkan ยอม แต่ wgpu ไม่ยอมและทิ้งทั้งเฟรม จึงผูกเต็มแถว 16 byte
+- **ลำดับคำสั่ง:** การเขียน buffer หรือ texture ถูกบันทึกเป็นการ copy ลง command encoder ตามลำดับที่เกมสั่ง ส่วน transient memory (เขียนครั้งเดียวต่อเฟรม) ส่งขึ้นตอน submit
+
+### สิ่งที่เจอระหว่างทาง
+
+- **เกมปิดเองแบบสุ่มโดยไม่มี crash report:**
+  - เกิดตอนคอมไพล์ shader เพราะ native code กิน stack เกินขอบ จนแม้แต่ JVM ก็เขียน report ไม่ได้
+  - ไฟล์เวอร์ชันของ launcher จึงใส่ `-XX:StackShadowPages=32` ไว้ ตัวทดลองใส่ตามแล้ว และ Rust ทำงาน shader ทั้งหมดบน thread ที่มี stack 64 MB
+  - ก่อนแก้รอดราว 50% หลังแก้ผ่านทุกครั้ง
+- **Rust ไม่เก็บ pointer ไปยังหน่วยความจำของ Java และไม่ยื่นหน่วยความจำของตัวเองให้ Java:** สำเนา CPU ที่เกม map เป็นของ Java แต่ละ call คัดลอกเฉพาะที่ต้องใช้ ตอนแรกให้ Java เขียนลงหน่วยความจำของ Rust แล้ว heap เสีย
+- **`allocateCpu` ต้องคืนบล็อกที่อยู่จนเฟรมจบ:** เกมอาจเก็บไว้แค่ address เหมือนที่ backend อื่นยอมให้ทำ
+- **อย่าให้ thread วาดภาพรอการคอมไพล์ pipeline:** การสร้าง pipeline (บน worker ของเกม) ใช้ device แยก ไม่ถือ lock เดียวกับเฟรม ก่อนแก้ หน้าต่างค้างจน Windows ขึ้นว่า Not Responding
+- **Vulkan ของ wgpu บอกว่าไม่รองรับ surface ของหน้าต่าง Win32 บนไดรเวอร์ AMD เครื่องนี้:** จึงใช้ DX12 แทน
+- **เครื่องมือดีบัก:** `HZ_WGPU_TRACE=1` (นับคำสั่งต่อเฟรม), `HZ_WGPU_DUMP=ไฟล์.ppm` กับ `HZ_WGPU_DUMP_FRAME` (บันทึกเฟรมที่ส่งขึ้นจอ)
+
+### ที่ยังเหลือ
+
+- **ขอบโลโก้ต่างจาก OpenGL ราว 0.2% ของ pixel:**
+  - backend Vulkan ของ Mojang ตรงกับ OpenGL ทุก pixel บน GPU เดียวกัน จึงไม่ใช่เรื่องที่ API ต่างกันปัดต่างกันเอง
+  - โลโก้ถูกย่อพอดีครึ่งหนึ่ง จุดที่ sample จึงตกบนเส้นแบ่ง texel พอดี และน่าจะปัดไปคนละด้าน (คาดว่าเกิดจากการกลับ y หรือ rasterizer ของ DX12) แต่ยังไม่ได้พิสูจน์
+- **เห็นแค่หน้า title:** เมฆ, OIT และ shader ของโลกคอมไพล์ผ่านทั้งหมด แต่ยังไม่ได้เทียบภาพในโลกจริง
+- **ยังไม่ได้ปรับความเร็ว:** ตอนนี้สร้าง bind group ทุก draw และ staging buffer ทุกครั้งที่เขียน ซึ่งพอสำหรับหน้า title แต่ในโลกจริงควรมี cache และ ring buffer
+- **ยังไม่รองรับ:** timestamp query, multi-draw และ indirect draw (รายงานว่าไม่รองรับ frontend จึงวาดทีละตัวแทน) และใช้ได้เฉพาะ Windows (surface สร้างจาก HWND)
 
 ## เอาอะไรจาก forge/ari มาใช้
 

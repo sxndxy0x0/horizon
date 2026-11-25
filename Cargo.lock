@@ -2824,6 +2824,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "horizon-wgpu-backend"
+version = "0.1.0"
+dependencies = [
+ "naga",
+ "pollster",
+ "raw-window-handle",
+ "wgpu",
+]
+
+[[package]]
 name = "horizon-world"
 version = "0.1.0"
 dependencies = [
@@ -3633,6 +3643,7 @@ dependencies = [
  "naga-types",
  "num-traits",
  "once_cell",
+ "petgraph",
  "pp-rs",
  "rustc-hash 1.1.0",
  "spirv",

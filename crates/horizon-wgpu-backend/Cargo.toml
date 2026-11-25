@@ -1,0 +1,23 @@
+[package]
+name = "horizon-wgpu-backend"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "P3 of docs/design/java-mods-everything.md: a renderpearl GPU backend for the Java game, drawn with wgpu through FFM"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+naga = { version = "30.0.1", features = ["spv-in"] }
+pollster = "0.4"
+raw-window-handle = "0.6"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "parking_lot", "vulkan", "dx12", "naga-ir", "wgsl"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+naga = { version = "30.0.1", features = ["spv-in", "spv-out", "wgsl-in"] }
