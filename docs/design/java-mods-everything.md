@@ -131,7 +131,19 @@
 - **ระบบไฟและ network ไม่ถูกม็อดแตะเลย** redstone ถูกแตะแค่ 4 (Lithium) ส่วนม็อดเนื้อหาใหญ่อย่าง AE2 แตะ method vanilla แค่ 15 ตัว
 - **ตัดออกจากชุด:** Iris NeoForge 26.3 (1.11.7) ใช้ร่วมกับ Sodium รุ่นไหนก็ไม่ได้ จึงเอาออก และใช้ Sodium 0.9.3 แทน 0.9.4-beta.2
 
-**สรุปสองตัว:** การเทียบกับ loader ที่ไม่ลงม็อดได้ผลทั้ง Fabric และ NeoForge จึงใช้เป็นวิธีหลักได้ ระบบไฟและ redstone ว่างให้ Rust เร่งในทั้งสองแพ็ก ส่วนที่ถูกแตะมักเป็นม็อดเร่งความเร็ว (Lithium, C2ME, Sodium) ซึ่งเป็นงานที่ Horizon จะทำแทนอยู่แล้ว
+### Forge 26.3-66.1.9 (ม็อด 11 ตัว: Biomes O' Plenty, GlitchCore, TerraBlender, GeckoLib, Xaero's Minimap, Xaero's World Map, Collective, Mouse Tweaks, Sound Physics Remastered, Iceberg, Forge Config API Port)
+
+- **บูตผ่าน ไม่ล้มเลยสักคลาส** Forge ใช้ `net.minecraftforge.bootstrap.ForgeBootstrap` และแก้เกมด้วย binary patch ทีละคลาส คลาสที่แก้ถูก compile ใหม่ด้วย (มี 16,526 method ที่เป็นแค่ compile ใหม่)
+- **Forge แก้เกมเอง 1,287 method** ส่วนใหญ่อยู่ใน entity (305) และ block (145) ระบบไฟถูกแตะ 1 ตัว และ redstone ไม่ถูกแตะ
+- **ม็อดแก้เพิ่มจาก Forge 133 method** ระบุที่มาไม่ได้ 7 ตัว ส่วนการเปลี่ยนสิทธิ์ 425 ตัวระบุได้ครบ (access transformer แบบ wildcard `*()` นับเป็นทั้งคลาส) ระบบไฟ, redstone และ network ไม่ถูกม็อดแตะเลย
+- **ม็อด worldgen ขนาดใหญ่อย่าง Biomes O' Plenty แทบไม่แตะ method ของเกม** ตัวที่แตะ worldgen คือ TerraBlender (10)
+
+### Quilt Loader 0.20.0-beta.9
+
+- **บูต 26.3 ไม่ได้ เป็นข้อจำกัดของ Quilt เอง ไม่ใช่ของตัวทดลอง:** Quilt ใช้ ASM 9.5 ซึ่งอ่านคลาสของ Java 25 (major version 69) ไม่ได้ จึงล้มตั้งแต่ `GameTransformer.locateEntrypoints` ก่อนโหลดม็อดใด ๆ และ QSL ก็ยังไม่มีรุ่นสำหรับ 26.3
+- **ผลต่อการออกแบบ:** ตอนนี้ผู้เล่น 26.3 ใช้ Quilt ไม่ได้ ไม่ว่าจะเป็นเกมจริงหรือ Horizon พอ Quilt ออกรุ่นที่รองรับแล้ว ให้รันตัวทดลองซ้ำด้วยคำสั่งเดิม
+
+**สรุปสี่ตัว:** การเทียบกับ loader ที่ไม่ลงม็อดได้ผลทั้ง Fabric, NeoForge และ Forge จึงใช้เป็นวิธีหลักได้ ส่วน Quilt ยังรองรับ 26.3 ไม่ได้ ระบบไฟและ redstone ว่างให้ Rust เร่งได้ในทั้งสามแพ็ก ส่วนที่ถูกแตะมักเป็นม็อดเร่งความเร็ว (Lithium, C2ME, Sodium) ซึ่งเป็นงานที่ Horizon จะทำแทนอยู่แล้ว
 
 ## เอาอะไรจาก forge/ari มาใช้
 

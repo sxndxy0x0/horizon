@@ -259,7 +259,8 @@ def access_entries(zf: zipfile.ZipFile) -> list[tuple[str, str | None]]:
                 # <access> <dotted class> [name[(desc)]]
                 cls = parts[1].replace(".", "/")
                 member = parts[2].split("(", 1)[0] if len(parts) >= 3 else None
-                out.append((cls, member))
+                # `*` and `*()` widen every field or method: keyed as the whole class.
+                out.append((cls, None if member == "*" else member))
     return out
 
 

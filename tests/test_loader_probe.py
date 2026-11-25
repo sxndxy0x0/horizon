@@ -65,14 +65,15 @@ class ModFactsTests(unittest.TestCase):
         outer = {
             "META-INF/jars/inner.jar": inner,
             "META-INF/neoforge.mods.toml": '[[accessTransformers]]\nfile="META-INF/at.cfg"\n',
-            "META-INF/at.cfg": "public net.minecraft.C tick()V\npublic-f net.minecraft.C speed\n",
+            "META-INF/at.cfg": "public net.minecraft.C tick()V\npublic-f net.minecraft.C speed\npublic net.minecraft.D *()\n",
         }
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "mod.jar").write_bytes(jar_bytes(outer))
             classes, access = probe.mod_facts(Path(tmp))
         self.assertEqual(classes["dev.x.mixin.AMixin"], "mod.jar")
         self.assertEqual(set(access), {("net/minecraft/A", "run"), ("net/minecraft/B", None),
-                                       ("net/minecraft/C", "tick"), ("net/minecraft/C", "speed")})
+                                       ("net/minecraft/C", "tick"), ("net/minecraft/C", "speed"),
+                                       ("net/minecraft/D", None)})
 
 
 if __name__ == "__main__":
