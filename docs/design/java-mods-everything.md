@@ -118,14 +118,16 @@
 - **ไม่ถูกแตะเลย 10,389 คลาส (91%)** ส่วน 994 คลาสถูกแก้ method ไป 1,604 ตัว (อีก 757 ตัวเปลี่ยนแค่สิทธิ์การเข้าถึง เพราะ access widener)
 - **ตัวที่แก้เยอะสุด:** Fabric API 551 ตัว ซึ่งเป็น patch ของ loader ที่รู้จัก (`RUST_WITH_MOMENTS`), ViaFabricPlus 434, C2ME 177 และ Iris 145
 - **ระบบไฟถูกแตะแค่ 3 method และ redstone ไม่ถูกแตะเลย:** จึงเป็นตัวเริ่มที่ดีสำหรับ accelerator ส่วน worldgen ถูก C2ME แตะ 74 ตัว ซึ่งเป็นม็อดเร่งความเร็วที่ Horizon มาแทนอยู่แล้ว
-- **ยังระบุที่มาไม่ได้ 124 ตัว:** ส่วนใหญ่เป็น `<init>`/`<clinit>` ที่ mixin เพิ่มค่าเริ่มต้นให้ field ตัวระบุที่มายังตามส่วนนี้ไม่ได้
+- **ระบุที่มาได้ครบทุก method แล้ว** (รอบที่สอง): ตัวทดลองอ่าน mixin config ในม็อดเองโดยตรง เจอ mixin 2,238 คลาสที่เล็งคลาส vanilla 932 ตัว ส่วน `<init>`/`<clinit>` ที่ mixin ใส่ค่าเริ่มต้นให้ field ก็ระบุได้จาก field ที่ mixin ประกาศ และการเปลี่ยนสิทธิ์การเข้าถึง 757 ตัวระบุได้จากไฟล์ access widener ของแต่ละม็อด (Fabric API 677, Sodium 291 ฯลฯ)
 - **ข้อ D ได้หลักฐานแล้ว:** ใน jar ของ 26.3 ระบบวาดภาพแยกเป็น API กลาง (`com/mojang/renderpearl/api`: `GpuBackend`, `GpuDevice`, `CommandEncoder`) และมี backend สองตัวคือ `backend/opengl` กับ `backend/vulkan` backend ตัวที่สามที่ทำด้วย wgpu จึงมีที่เสียบรออยู่แล้ว
 
 ### NeoForge 26.3.0.118 (ม็อด 13 ตัว: Sodium, Lithium, FerriteCore, ImmediatelyFast, Entity Culling, AE2, GuideME, JEI, Mezz Config, AppleSkin, Xaero's Minimap, Architectury, Cloth Config)
 
 - **ข้อค้นพบสำคัญ:** NeoForge สร้าง jar ของเกมใหม่ด้วยการ decompile แล้ว compile กลับ (`minecraft-client-patched`) bytecode เลยต่างจาก vanilla ถึง 86,812 method ทั้งที่ NeoForge แก้จริงแค่บางส่วน เช่น `ARGB.computeSrgbToLinear` ที่ NeoForge ไม่ได้แตะเลยก็ยังต่าง
-  - **ผลต่อการออกแบบ:** baseline ต้องเป็น **loader ตัวเดียวกันที่ไม่ลงม็อด** ไม่ใช่ vanilla (ตัวทดลองรันสองรอบอัตโนมัติแล้ว) ส่วนจะรู้ว่า NeoForge แก้ method vanilla ตัวไหนจริง ต้องอ่านจาก source patch ของ NeoForge (โฟลเดอร์ `patches/` ใน repo ของ NeoForge) ใช้ bytecode ตัดสินไม่ได้
-- **ม็อดแก้เพิ่มจาก NeoForge แค่ 658 method:** Lithium 358, Sodium 99, ImmediatelyFast 25, Xaero 25, Architectury 19, AE2 15
+  - **ผลต่อการออกแบบ:** baseline สำหรับม็อดต้องเป็น **loader ตัวเดียวกันที่ไม่ลงม็อด** ไม่ใช่ vanilla (ตัวทดลองรันสองรอบอัตโนมัติแล้ว)
+  - **การแก้ของ NeoForge เองหาได้จาก "สิ่งที่ method อ้างถึง":** เทียบการเรียก method, field, type และค่าคงที่แบบเรียงลำดับ แทนการเทียบคำสั่งตรง ๆ การ compile ใหม่จะย้ายตำแหน่ง branch แต่ไม่เปลี่ยนสิ่งที่อ้างถึง ส่วน patch จะเปลี่ยน ผลคือ method ที่ต่าง 86,812 ตัว ลดเหลือที่แก้จริง 2,186 ตัว (อีก 71,279 เป็นแค่ compile ใหม่) และไม่นับ lambda เพราะชื่อถูกเรียงเลขใหม่
+  - **ตรวจกับ source patch จริงของ NeoForge (850 ไฟล์ จาก branch `26.3.x`):** ตัวทดลองเจอ 96% ของคลาสที่มี patch ส่วนคลาสที่ตัวทดลองเจอแต่ไม่มีไฟล์ patch มี 244 คลาสที่เปลี่ยนแค่สิทธิ์การเข้าถึง (มาจาก access transformer ของ NeoForge เอง ไม่ได้อยู่ใน patch) และประมาณ 600 method ที่อาจเป็นสิ่งรบกวนจากการ compile ใหม่ หรือ coremod ของ NeoForge ตัวเลขนี้จึงเป็นขอบบน ฝั่งที่ปลอดภัย (อาจสั่งให้ Java รันเกินจำเป็น แต่ไม่ทำให้ม็อดพัง)
+- **ม็อดแก้เพิ่มจาก NeoForge 610 method** (นับใหม่หลังแยกการเปลี่ยนสิทธิ์ 48 ตัวออก) ระบุที่มาไม่ได้แค่ 1 ตัว: Lithium มากที่สุด ตามด้วย Sodium, ImmediatelyFast, Xaero, Architectury และ AE2
 - **ระบบไฟและ network ไม่ถูกม็อดแตะเลย** redstone ถูกแตะแค่ 4 (Lithium) ส่วนม็อดเนื้อหาใหญ่อย่าง AE2 แตะ method vanilla แค่ 15 ตัว
 - **ตัดออกจากชุด:** Iris NeoForge 26.3 (1.11.7) ใช้ร่วมกับ Sodium รุ่นไหนก็ไม่ได้ จึงเอาออก และใช้ Sodium 0.9.3 แทน 0.9.4-beta.2
 

@@ -35,14 +35,17 @@ public final class Agent {
     static final Set<String> VANILLA = ConcurrentHashMap.newKeySet();
     static Path vanillaJar;
     static Path out;
+    /** The run's mods folder, where the probe reads the mixin configs; null without mods. */
+    static Path mods;
 
     private Agent() {}
 
-    /** Arguments: {@code <vanilla jar>|<output folder>}. */
+    /** Arguments: {@code <vanilla jar>|<output folder>[|<mods folder>]}. */
     public static void premain(String args, Instrumentation inst) throws Exception {
-        String[] parts = args.split("\\|", 2);
+        String[] parts = args.split("\\|", 3);
         vanillaJar = Path.of(parts[0]);
         out = Path.of(parts[1]);
+        mods = parts.length > 2 ? Path.of(parts[2]) : null;
         try (ZipFile jar = new ZipFile(vanillaJar.toFile())) {
             jar.stream()
                     .map(ZipEntry::getName)
