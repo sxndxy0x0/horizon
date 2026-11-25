@@ -69,7 +69,7 @@
 - **ใช้แบบเดียวกันกับ:** ไฟ (`DataLayer`), heightmap, biome
 - **entity เป็น object ของ Java ตามเดิม** (เปลี่ยนแปลงได้หลากหลายเกินไป) accelerator ที่ต้องใช้ข้อมูล entity อ่านผ่าน view
 - **ลำดับการเร่ง:** เร่งชุดที่ทำงานกับข้อมูลร่วมก่อน คือไฟ, mesh ของ chunk, worldgen และการชน ซึ่งเป็นส่วนที่หนักที่สุดด้วย ส่วนที่ต้องใช้ entity เป็นหลัก เช่น AI ของ mob ทำทีหลัง
-- **ลำดับการทำงานเหมือน vanilla:** tick ของแต่ละ level ใช้ thread เดียว ส่วนงานขนานของ Rust ทำบน snapshot (copy-on-write ต่อ section)
+- **ลำดับการทำงานเหมือน vanilla:** tick ของแต่ละ level ใช้ thread เดียว Rust แตะข้อมูลได้เฉพาะบน thread ที่เป็นเจ้าของข้อมูลนั้น (บล็อกอยู่บน thread ของ level, แสงอยู่บน thread แสง) ซึ่งพิสูจน์แล้วใน P2 ส่วนงานขนานของ Rust ทำบน snapshot (copy-on-write ต่อ section)
 
 ### D. การวาดภาพ
 
@@ -106,7 +106,7 @@
 ## ลำดับพิสูจน์ (ของเล็กก่อน)
 
 1. ✅ **P1 Agent + diff ของ bytecode:** บูต Fabric 26.3 และ NeoForge 26.3 จริงพร้อมม็อดตัวอย่างใน JVM ธรรมดา แล้วให้ agent ออกรายงานว่าม็อดแตะ method ไหน ยังไม่ต้องใช้ Horizon เครื่องนี้มี Fabric 26.3 อยู่แล้ว
-2. ✅ **P2 หน่วยความจำร่วม:** `PalettedContainer` ของ Java บนหน่วยความจำของ Rust เซฟแล้วได้ผลตรงกับ vanilla ทุก byte
+2. ✅ **P2 หน่วยความจำร่วม:** บล็อก แสง และ heightmap ของเกม Java ตัวจริงอยู่บนหน่วยความจำของ Rust โลกจริงที่แก้แล้วให้แสงแล้วเซฟออกมาตรงกับ vanilla ทุก chunk และ `LevelAccess` ของ Horizon อ่านเขียนโลกที่กำลังรันอยู่ได้ตรง
 3. **P3 วาดภาพ:** หน้า title ของ Java client จริงวาดผ่าน backend wgpu
 4. **P4 accelerator ตัวแรก:** ระบบไฟ เปิดเมื่อแผนบอกว่าปลอดภัย และผ่าน parity harness เดิม
 
@@ -193,47 +193,81 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
 
 ## ผล P2 (2026-11-25): โค้ด vanilla ทำงานบนหน่วยความจำของ Rust
 
-ตัวทดลอง: `python tools/shared_memory_probe.py`
+ตัวทดลอง: `python tools/shared_memory_probe.py` (ใส่ `--horizon-resources DIR` ที่มี `facts.json` ของ Horizon เพื่อตรวจ registry ด้วย)
 
-- **ฝั่ง Rust:** crate `crates/horizon-shm-probe` (cdylib) จองหน่วยความจำของ storage และอ่านเขียนด้วยโค้ดของ `horizon-core` เอง (`PackedStorage`, `PalettedContainer`)
-- **ฝั่ง Java:** `mods/horizon/src/shared-memory-probe/` ประกอบด้วย
-  - `RustBitStorage` คือ `SimpleBitStorage` ที่ทุกการอ่านเขียนไปลงหน่วยความจำของ Rust ตรง ๆ ผ่าน FFM (`java.lang.foreign`) ไม่มีการคัดลอก
-  - Agent เปลี่ยนทุก `new SimpleBitStorage(...)` ในโค้ดเกมเป็น `RustBitStorage.create(...)` (ทำงานบน bytecode จึงใช้ได้ทุก loader)
+- **ฝั่ง Rust:** crate `crates/horizon-shm-probe` (cdylib) จองหน่วยความจำ และอ่านเขียนด้วยโค้ดของ Horizon เอง
+  - `PackedStorage` ของ `horizon-core` ยืม word ได้แล้ว (`PackedStorage<&[u64]>` สำหรับอ่าน, `PackedStorage<&mut [u64]>` สำหรับเขียน) โดยไม่คัดลอก ค่าเริ่มต้นยังเป็น `Vec` เหมือนเดิม โค้ดที่เรียกใช้อยู่จึงไม่ต้องแก้
+  - `JavaLevel` (`src/level.rs`) คือ `LevelAccess` ของ `horizon-world` ซึ่งเป็น interface โลกที่โค้ด Horizon ใช้ ทำงานบนโลก Java ที่กำลังรันอยู่ ทั้งบล็อก แสง และ heightmap อ่านจากหน่วยความจำของเกมตรง ๆ
+- **ฝั่ง Java:** `mods/horizon/src/shared-memory-probe/`
+  - `RustBitStorage` คือ `SimpleBitStorage` (บล็อก, biome, heightmap) และ `RustDataLayer` คือ `DataLayer` (แสง) ทุกการอ่านเขียนลงหน่วยความจำของ Rust ตรง ๆ ผ่าน FFM
+  - Agent เปลี่ยนทุก `new SimpleBitStorage(...)`, `new DataLayer(...)` และ method reference `DataLayer::new` ในโค้ดเกมไปเป็น factory ของเรา (ทำงานบน bytecode จึงใช้ได้ทุก loader)
+  - `World` คือตัวทดลองบนเซิร์ฟเวอร์ GameTest ของ vanilla ซึ่งเป็นเซิร์ฟเวอร์เกมจริงที่ไม่ต้องมีผู้เล่นและไม่ต้องยอมรับ EULA
 
-### วิธีทดสอบ
+### 1. ตัวทดลอง storage
 
-รันงานชุดเดียวกันสองรอบ รอบแรกบน storage ของ vanilla รอบสองบน storage ของ Rust แล้วเทียบผล
+รันงานชุดเดียวกันบนหน่วยความจำของ vanilla และของ Rust แล้วเทียบกัน
 
-- **96 section:** แต่ละ section มีจำนวนสถานะบล็อกต่างกัน (1 ถึง 5,000) ครอบคลุม palette ทุกแบบ ได้แก่ single, linear, hash map และ global แต่ละ section ทำ `getAndSet` 9,000 ครั้ง
-- **สิ่งที่เทียบ:** ค่าทุก cell, byte ที่ส่งผ่าน network, การอ่านกลับจาก network, `copy()`, ข้อมูลตอนเซฟ (codec ของ `PalettedContainer`) และลำดับค่าที่ `getAndSet` คืน
+- **96 section:** จำนวนสถานะบล็อก 1 ถึง 5,000 ครอบคลุม palette ทุกแบบ ตรงกันทั้ง 96/96 ทั้งค่าทุก cell, byte ที่ส่งผ่าน network, การอ่านกลับ, `copy()` และข้อมูลตอนเซฟ
+- **Rust อ่านหน่วยความจำเดียวกันด้วยโค้ดของ `horizon-core`:** ตรวจ 352 ครั้ง ผิด 0 ครั้ง
+- **`RustBitStorage` เทียบกับ `SimpleBitStorage` ทีละคำสั่ง:** 128 กรณี ได้ long ตรงกันทุก bit
+- **`RustDataLayer` เทียบกับ `DataLayer`:** 96 กรณี ตรงกันทั้งระดับแสงทุกจุด, flag ทุกตัว, byte, ข้อความ และ copy และ Rust อ่านแสงจากหน่วยความจำได้ถูกทุก layer
+- **8 thread พร้อมกัน:** แต่ละ thread มี container ของตัวเองตามกฎของเกม (หนึ่ง container ต่อหนึ่ง thread) Cleaner คืนหน่วยความจำไปพร้อมกัน ตรวจ 1,966,560 ครั้ง ผิด 0 ครั้ง
 
-### ผล
+### 2. ตัวทดลองโลกจริง
 
-- **ตรงกันทั้ง 96/96 section ทุกตัวที่เทียบ**
-- **Rust อ่านหน่วยความจำเดียวกันด้วย `horizon-core` ตรวจ 352 ครั้ง ผิด 0 ครั้ง:**
-  - ค่าทุกตัวใน storage ตรงกัน
-  - `PalettedContainer` ของ `horizon-core` ที่สร้างจาก word เดียวกันกับ palette เดียวกัน อ่านทุก cell ได้ตรง
-  - Rust เขียน cell ลงไปแล้ว Java อ่านเห็นทันที
-- **`RustBitStorage` เทียบกับ `SimpleBitStorage` ทีละคำสั่ง:** bit 1–32 × ขนาด 1, 37, 64, 4096 รวม 128 กรณี ได้ long ตรงกันทุก bit รวมถึง padding ที่ `fill` ใส่ไว้
-- **ความเร็ว** (เครื่องของผู้พัฒนา ns ต่อการทำงานหนึ่งครั้ง 3 รอบ):
+ใช้เซิร์ฟเวอร์เกมจริงกับโลกแบบ normal ขนาด 144 chunk แช่ tick ไว้ (`tick freeze`) จึงไม่มี block tick, mob หรือ random tick มารบกวน แต่ระบบ chunk, แสง และ heightmap ยังทำงานตามปกติ
+
+- **vanilla รันเทียบกับตัวเองไม่ได้:** ลองรันสร้างโลกสองรอบด้วย seed เดียวกัน chunk ต่างกัน 130/144 เพราะ worldgen หลาย thread วาง feature ที่ทับกันในลำดับต่างกันทุกครั้ง การทดลองจึงเริ่มจากเซฟเดียวกันทุกรอบ
+- **เซฟเดียวกัน → แก้บล็อก 40,000 จุด (มีทั้งของที่ให้แสงและบล็อกทึบ) → รอแสงนิ่ง → เซฟ:**
+  - เทียบหน่วยความจำของ vanilla กับของ Rust
+  - ต่างกัน 0/144 chunk ทั้งบล็อก, biome, แสงบล็อก, แสงท้องฟ้า, heightmap และ NBT ที่เซฟ
+  - vanilla เทียบกับตัวเองก็ได้ 0 เช่นกัน แสดงว่าวิธีทดสอบนี้เชื่อถือได้
+- **สร้างโลกใหม่บนหน่วยความจำของ Rust (worldgen รันบน worker thread ของเกม) แล้วให้ vanilla โหลดเซฟนั้น:**
+  - บล็อก, biome, แสง และ heightmap ต่าง 0 ทั้งใน 64 chunk ด้านในและที่ขอบ
+  - NBT ที่เซฟซ้ำต่างกันเท่ากับที่ vanilla เซฟซ้ำโลกของตัวเอง คือ 63 chunk ด้านในและ 80 chunk ที่ขอบ ที่ต่างเพราะ tick ที่รออยู่นับจากนาฬิกาของแต่ละรอบ และ palette กลับมาในลำดับใหม่ ส่วนเนื้อหาบล็อกยังตรงกัน
+  - ขอบ 2 วงไม่นับเป็นผ่านหรือไม่ผ่าน เพราะหลังโหลดเซฟ เพื่อนบ้านยังสร้างและให้แสงต่อ ใน vanilla เองบางรอบก็ต่างตรงขอบ
+- **Horizon บนโลกที่กำลังรันอยู่** (ทั้งรอบโหลดเซฟและรอบสร้างโลกใหม่):
+  - section ที่ลงทะเบียน 3,321 อยู่บนหน่วยความจำ Rust ทั้งหมด (ไม่มี section ที่ยังใช้ของ Java), light layer 7,488 และ heightmap 576 ก็อยู่บน Rust ทั้งหมดเช่นกัน
+  - `LevelAccess` ของ Horizon อ่าน 144 chunk บน 8 thread ของ Rust ได้บล็อก, แสงทั้งสองชนิด และ heightmap ตรงกับที่เกมเห็น ผิด 0
+  - Horizon เขียนบล็อกผ่าน `LevelAccess::set_raw` 500 ครั้ง เกมเห็นทันที ผิด 0
+- **ID ของ registry Horizon คือ ID ของเกม:** ทั้ง 35,723 สถานะบล็อก ชื่อและ property ตรงกันหมด
+
+### กฎของ thread (พิสูจน์แล้ว)
+
+- Rust อ่านหรือเขียน section ได้เฉพาะตอนที่ไม่มี thread ของ Java เขียน section นั้นอยู่ ซึ่งเป็นกฎเดียวกับที่ `ThreadingDetector` ของ `PalettedContainer` บังคับอยู่แล้ว
+- แสงถูกเขียนบน thread แสงของเกมเอง (`ConsecutiveExecutor` ของ `ThreadedLevelLightEngine`) การทดลองจึงส่งงานอ่านของ Rust เข้าไปเป็น task บน thread นั้น
+  - รอบแรกที่อ่านจาก thread อื่น แสงต่างจาก Java 3 chunk เพราะเกมยังให้แสง chunk ขอบอยู่ระหว่างนั้น
+  - พอย้ายเข้า thread แสงแล้วผิด 0
+- accelerator ของจริงจะต้องรันบน thread เจ้าของข้อมูลแบบเดียวกัน
+
+### ความเร็ว
+
+เครื่องของผู้พัฒนา ns ต่อการทำงานหนึ่งครั้ง วัดหลังทำงานชุดเดียวกันในทั้งสองรอบ
 
 | | vanilla | Rust |
 |---|---:|---:|
-| storage ตรง ๆ (`getAndSet` + `get`) | 9.0 / 11.8 / 9.2 | 9.7 / 11.5 / 11.2 |
-| ผ่าน `PalettedContainer` | 104 / 94 / 99 | 114 / 114 / 120 |
+| storage ตรง ๆ (`getAndSet` + `get`) | 11.1 / 13.0 / 9.6 / 11.8 | 11.3 / 12.2 / 9.7 / 11.0 |
+| ผ่าน `PalettedContainer` | 118.5 / 109.6 / 112.4 / 115.5 | 116.5 / 124.0 / 100.0 / 122.2 |
 
-  storage เท่ากันในระดับ noise ระหว่างรอบ (ใช้ VarHandle ของ array view และการหารแบบคูณ-shift แบบเดียวกับ vanilla) ส่วนผ่าน container ช้ากว่า 10–20% ยังต้องหาสาเหตุ
+- **เท่ากันในระดับ noise ของเครื่อง:** container เฉลี่ยราว 114 กับ 116 ns ส่วนช่วงห่าง 10–20% เดิมหายไปแล้ว
+- **ที่แก้:**
+  - อ่าน word ผ่าน segment เดียวที่ครอบทุก address (`Rust.ALL`) ซึ่งเป็นค่าคงที่ JIT จึงตัดการตรวจขอบเขตและอายุของ segment ทิ้งได้
+  - ใช้ layout แบบไม่ตรวจ alignment
+  - วัดผลหลังจากทั้งสองรอบทำงานชุดเดียวกันแล้ว (ก่อนหน้านี้รอบ Rust วัดหลังงานตรวจที่หนักกว่า)
 
 ### สิ่งที่เจอระหว่างทาง
 
-- **โค้ด vanilla เขียนลงใน array ที่ `getRaw()` คืนมาโดยตรง:** `PalettedContainer.read` (อ่าน section จาก network) และ `Heightmap.setRawData` เพราะ array บน heap ชี้หน่วยความจำนอก heap ไม่ได้ Agent จึงเปลี่ยนทุก `getRaw()` เป็น `RustBitStorage.raw(...)` ซึ่งให้สำเนาไป และตอนจบ method ที่เรียกมันจะเขียนส่วนที่ถูกแก้กลับลงหน่วยความจำของ Rust (`flush`)
-- **ในทั้ง jar มี 7 จุดที่เรียก `getRaw()` ของ storage:** ข้อสรุปนี้จึงมาจากการตรวจทุกจุด ไม่ใช่การเดา
+- **โค้ด vanilla เขียนลงใน array ที่ `getRaw()` คืนมาโดยตรง:** ที่ `PalettedContainer.read` และ `Heightmap.setRawData` Agent จึงให้สำเนาไป แล้วเขียนส่วนที่ถูกแก้กลับเมื่อ method จบ (ทั้ง jar มี 7 จุดที่เรียก `getRaw()` ตรวจครบทุกจุด)
+- **`DataLayer.getData()` ของ `RustDataLayer` คืนสำเนา:** ตรวจทุกจุดที่เรียกใน jar แล้ว ได้แก่ packet, การเซฟ chunk และการ copy ของ sky storage ไม่มีจุดไหนเขียนลง array นั้น
+- **`SerializableChunkData` สร้าง `DataLayer` ผ่าน method reference (`DataLayer::new`):** Agent จึงเปลี่ยน handle ใน `invokedynamic` ด้วย
+- **`getChunkNow` คืน null เมื่อเรียกจาก thread อื่น:** chunk ต้องรับมาบน server thread ก่อน
+- **มีครั้งหนึ่งที่เซิร์ฟเวอร์ปิดเองตอนเริ่ม (exit 1) โดยไม่มี log:** สั่งเดิมซ้ำด้วยมือผ่าน และเปิดเซิร์ฟเวอร์ต่ออีก 21 ครั้งก็ไม่เกิดอีก ยังไม่รู้สาเหตุ
 
-### ที่ยังไม่ได้พิสูจน์ใน P2
+### ที่ยังเหลือ (เป็นงานของขั้นถัดไป ไม่ใช่ช่องโหว่ของ P2)
 
-- **ยังไม่ได้ลองใน Horizon จริง:** ตอนนี้ Rust เป็นเจ้าของหน่วยความจำ แต่ยังไม่ได้ให้ `World` ของ Horizon ใช้หน่วยความจำนั้นเป็นที่เก็บ chunk จริง อีกทั้ง `PackedStorage` ของ `horizon-core` ยังถือ `Vec` ของตัวเอง ต้องมีรุ่นที่ยืม word ได้ (ตอนนี้ฝั่ง Rust อ่านผ่านสำเนา ส่วนฝั่ง Java ไม่มีการคัดลอก)
-- **ยังไม่ได้ทำ:** ระบบไฟ (`DataLayer`), heightmap ในโลกจริง และการทำงานหลาย thread
-- **ยังไม่ได้ตรวจ:** `cargo fmt` และ `clippy` เพราะเครื่องนี้ไม่ได้ติดตั้ง rustfmt/clippy แต่ `cargo test -p horizon-shm-probe` ผ่าน
+- **palette ส่งให้ Rust เป็นสำเนา:** มีไม่เกิน 2^bits id และ Java ขยายได้ทุกเมื่อ ส่วน word ของ storage และแสงไม่มีการคัดลอก
+- **`PalettedContainer` ของ `horizon-core` (คนละตัวกับ `PackedStorage`) ยังถือ word ของตัวเอง:** `JavaLevel` จึงอ่าน section ผ่าน `PackedStorage` ที่ยืม word แทน
+- **การให้ accelerator จริงรันบน thread เจ้าของข้อมูลเป็นงานของ P4 (ระบบไฟ)**
 
 ## เอาอะไรจาก forge/ari มาใช้
 

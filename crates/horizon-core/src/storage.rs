@@ -92,8 +92,11 @@ impl WordRun<'_> {
     }
 }
 
+/// The words are a `Vec` the storage owns by default. Borrowed words work as well, so code can read
+/// (`PackedStorage<&[u64]>`) or write (`PackedStorage<&mut [u64]>`) words that something else owns, such as the
+/// game's own storage in memory shared with Java, without copying them.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PackedStorage {
+pub struct PackedStorage<W = Vec<u64>> {
     bits: u8,
     len: usize,
     per_word: usize,
@@ -101,7 +104,7 @@ pub struct PackedStorage {
     /// Whether `len` is past what [`locate`] handles exactly; such a storage
     /// falls back to division.
     wide: bool,
-    words: Vec<u64>,
+    words: W,
 }
 
 impl PackedStorage {
@@ -110,18 +113,27 @@ impl PackedStorage {
         self.words.capacity() * std::mem::size_of::<u64>()
     }
     pub fn new(bits: u8, len: usize) -> Result<Self, StorageError> {
-        let per_word = Self::per_word(bits)?;
+        let per_word = per_word(bits)?;
         Self::from_words(bits, len, vec![0; len.div_ceil(per_word)])
     }
+}
 
+fn per_word(bits: u8) -> Result<usize, StorageError> {
+    if !(1..=32).contains(&bits) {
+        return Err(StorageError::InvalidBits(bits));
+    }
+    Ok(64 / usize::from(bits))
+}
+
+impl<W: AsRef<[u64]>> PackedStorage<W> {
     /// Retains padding and unused tail bits from input, as the Java long[] does.
-    pub fn from_words(bits: u8, len: usize, words: Vec<u64>) -> Result<Self, StorageError> {
-        let per_word = Self::per_word(bits)?;
+    pub fn from_words(bits: u8, len: usize, words: W) -> Result<Self, StorageError> {
+        let per_word = per_word(bits)?;
         let expected = len.div_ceil(per_word);
-        if words.len() != expected {
+        if words.as_ref().len() != expected {
             return Err(StorageError::InvalidLength {
                 expected,
-                actual: words.len(),
+                actual: words.as_ref().len(),
             });
         }
         Ok(Self {
@@ -134,13 +146,6 @@ impl PackedStorage {
         })
     }
 
-    fn per_word(bits: u8) -> Result<usize, StorageError> {
-        if !(1..=32).contains(&bits) {
-            return Err(StorageError::InvalidBits(bits));
-        }
-        Ok(64 / usize::from(bits))
-    }
-
     pub fn bits(&self) -> u8 {
         self.bits
     }
@@ -151,7 +156,7 @@ impl PackedStorage {
         self.len == 0
     }
     pub fn words(&self) -> &[u64] {
-        &self.words
+        self.words.as_ref()
     }
 
     /// The word and bit shift of an in-range index.
@@ -179,7 +184,7 @@ impl PackedStorage {
 
     pub fn get(&self, index: usize) -> Result<u32, StorageError> {
         let (word, shift) = self.location(index)?;
-        Ok(((self.words[word] >> shift) & self.mask) as u32)
+        Ok(((self.words()[word] >> shift) & self.mask) as u32)
     }
 
     /// Reads `index` without a bounds check. Callers use this once they hold a
@@ -189,19 +194,7 @@ impl PackedStorage {
     pub fn read(&self, index: usize) -> u32 {
         debug_assert!(index < self.len);
         let (word, shift) = self.slot(index);
-        ((self.words[word] >> shift) & self.mask) as u32
-    }
-
-    /// Writes `value` at `index` without revalidating either. `index` must be
-    /// less than `len` and `value` must fit `bits`, which holds for a section
-    /// palette index from the same container. Returns the previous value.
-    #[inline]
-    pub fn write(&mut self, index: usize, value: u32) -> u32 {
-        debug_assert!(index < self.len && u64::from(value) <= self.mask);
-        let (word, shift) = self.slot(index);
-        let old = ((self.words[word] >> shift) & self.mask) as u32;
-        self.words[word] = (self.words[word] & !(self.mask << shift)) | (u64::from(value) << shift);
-        old
+        ((self.words()[word] >> shift) & self.mask) as u32
     }
 
     /// The word and bit shift of an entry: [`read_at`](Self::read_at) and
@@ -222,6 +215,47 @@ impl PackedStorage {
     pub fn fixed_shift(&self, stride: usize) -> bool {
         stride.is_multiple_of(self.per_word)
     }
+    /// [`read`](Self::read) at a slot `slot_of` returned for the same index.
+    #[inline]
+    pub fn read_at(&self, slot: Slot) -> u32 {
+        ((self.words()[slot.word] >> slot.shift) & self.mask) as u32
+    }
+
+    /// [`unpack`](Self::unpack) into `out` (the first `len` slots), without allocating.
+    pub fn unpack_into(&self, out: &mut [u32]) {
+        let mut i = 0;
+        for &word in self.words() {
+            for slot in 0..self.per_word.min(self.len - i) {
+                out[i] = ((word >> (slot * usize::from(self.bits))) & self.mask) as u32;
+                i += 1;
+            }
+        }
+    }
+    pub fn unpack(&self) -> Vec<u32> {
+        let mut values = Vec::with_capacity(self.len);
+        for &word in self.words() {
+            for slot in 0..self.per_word.min(self.len - values.len()) {
+                values.push(((word >> (slot * usize::from(self.bits))) & self.mask) as u32);
+            }
+        }
+        values
+    }
+}
+
+impl<W: AsRef<[u64]> + AsMut<[u64]>> PackedStorage<W> {
+    /// Writes `value` at `index` without revalidating either. `index` must be
+    /// less than `len` and `value` must fit `bits`, which holds for a section
+    /// palette index from the same container. Returns the previous value.
+    #[inline]
+    pub fn write(&mut self, index: usize, value: u32) -> u32 {
+        debug_assert!(index < self.len && u64::from(value) <= self.mask);
+        let (word, shift) = self.slot(index);
+        let cell = &mut self.words.as_mut()[word];
+        let old = ((*cell >> shift) & self.mask) as u32;
+        *cell = (*cell & !(self.mask << shift)) | (u64::from(value) << shift);
+        old
+    }
+
     /// The run of entries `stride` apart starting **one stride before**
     /// `index`, which must keep one bit shift ([`fixed_shift`](Self::fixed_shift))
     /// and hold `value`. Its calls write `index - stride`, then `index - 2 *
@@ -231,7 +265,7 @@ impl PackedStorage {
         let (word, shift) = self.slot(index);
         let mask = self.mask;
         WordRun {
-            words: &mut self.words,
+            words: self.words.as_mut(),
             word,
             step: stride / self.per_word,
             shift,
@@ -239,16 +273,11 @@ impl PackedStorage {
             value: u64::from(value) << shift,
         }
     }
-    /// [`read`](Self::read) at a slot `slot_of` returned for the same index.
-    #[inline]
-    pub fn read_at(&self, slot: Slot) -> u32 {
-        ((self.words[slot.word] >> slot.shift) & self.mask) as u32
-    }
     /// [`write`](Self::write) at a slot `slot_of` returned for the same index.
     #[inline]
     pub fn write_at(&mut self, slot: Slot, value: u32) -> u32 {
         debug_assert!(u64::from(value) <= self.mask);
-        let word = &mut self.words[slot.word];
+        let word = &mut self.words.as_mut()[slot.word];
         let old = ((*word >> slot.shift) & self.mask) as u32;
         *word = (*word & !(self.mask << slot.shift)) | (u64::from(value) << slot.shift);
         old
@@ -261,8 +290,9 @@ impl PackedStorage {
         if u64::from(value) > self.mask || value > i32::MAX as u32 {
             return Err(StorageError::ValueTooLarge(value));
         }
-        let old = ((self.words[word] >> shift) & self.mask) as u32;
-        self.words[word] = (self.words[word] & !(self.mask << shift)) | (u64::from(value) << shift);
+        let cell = &mut self.words.as_mut()[word];
+        let old = ((*cell >> shift) & self.mask) as u32;
+        *cell = (*cell & !(self.mask << shift)) | (u64::from(value) << shift);
         Ok(old)
     }
 
@@ -277,34 +307,31 @@ impl PackedStorage {
             word |= word << shift;
             shift *= 2;
         }
-        self.words.fill(word);
+        self.words.as_mut().fill(word);
         Ok(())
-    }
-
-    /// [`unpack`](Self::unpack) into `out` (the first `len` slots), without allocating.
-    pub fn unpack_into(&self, out: &mut [u32]) {
-        let mut i = 0;
-        for &word in &self.words {
-            for slot in 0..self.per_word.min(self.len - i) {
-                out[i] = ((word >> (slot * usize::from(self.bits))) & self.mask) as u32;
-                i += 1;
-            }
-        }
-    }
-    pub fn unpack(&self) -> Vec<u32> {
-        let mut values = Vec::with_capacity(self.len);
-        for &word in &self.words {
-            for slot in 0..self.per_word.min(self.len - values.len()) {
-                values.push(((word >> (slot * usize::from(self.bits))) & self.mask) as u32);
-            }
-        }
-        values
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Borrowed words read and write exactly as owned ones, in place.
+    #[test]
+    fn borrowed_words_read_and_write_in_place() {
+        let mut owned = PackedStorage::new(5, 4096).unwrap();
+        for i in 0..4096 {
+            owned.set(i, (i * 7 % 32) as u32).unwrap();
+        }
+        let mut words = owned.words().to_vec();
+        let view = PackedStorage::from_words(5, 4096, words.as_slice()).unwrap();
+        assert_eq!(view.unpack(), owned.unpack());
+        assert_eq!(view.read(4095), owned.read(4095));
+        let mut lent = PackedStorage::from_words(5, 4096, words.as_mut_slice()).unwrap();
+        assert_eq!(lent.set(17, 3).unwrap(), owned.set(17, 3).unwrap());
+        assert_eq!(words, owned.words());
+        assert!(PackedStorage::from_words(5, 4096, &words[1..]).is_err());
+    }
 
     #[test]
     fn padded_words_never_split_entries() {

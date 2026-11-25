@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
-"""P2 of docs/design/java-mods-everything.md: vanilla's block storage on memory Rust owns.
+"""P2 of docs/design/java-mods-everything.md: vanilla's block storage and light on memory Rust owns.
 
-Runs the same vanilla block-storage work twice in one JVM setup: on vanilla's own SimpleBitStorage, and with
-the agent in mods/horizon/src/shared-memory-probe/ putting every SimpleBitStorage the game creates in memory
-that crates/horizon-shm-probe owns (Java reads and writes it in place through FFM). Then compares the two runs
-(every section's cells, network bytes, saved form, copies and read-backs), reports the checks Rust made on the
-same memory with horizon-core's own code, and the speed of both.
+The agent in mods/horizon/src/shared-memory-probe/ puts every SimpleBitStorage and DataLayer the game creates in
+memory that crates/horizon-shm-probe owns (Java reads and writes it in place through FFM). Two probes, each run on
+vanilla's own memory and on Rust's:
+
+- the storage probe: the same block-storage and light work, compared section by section (cells, network bytes,
+  saved form, copies, read-backs), checks Rust makes on the same memory, eight threads at once, and speed;
+- the world probe, on the real game server (vanilla's game-test server) and a normal world:
+  1. vanilla generates the world and saves it;
+  2. from copies of that save, vanilla (twice: the control) and then Rust's memory load it, the probe edits it,
+     the game lights it, keeps its heightmaps and saves it; every chunk must match;
+  3. Rust's memory generates a world of its own (worldgen on the game's worker threads), and vanilla loads that
+     save back: what vanilla reads must be what the Rust-memory run held.
+  On Rust's memory Horizon's own LevelAccess reads the live world in place on several threads and writes into
+  it, and Horizon's block registry is checked against the game's.
 
     python tools/shared_memory_probe.py                  # the launcher's 26.3 install
-    python tools/shared_memory_probe.py --minecraft DIR --version 26.3
+    python tools/shared_memory_probe.py --minecraft DIR --version 26.3 --horizon-resources DIR
 """
 
 from __future__ import annotations
@@ -81,6 +90,10 @@ def main() -> int:
     ap.add_argument("--version", default="26.3")
     ap.add_argument("--out", type=Path, default=ROOT / ".local" / "shared-memory-probe")
     ap.add_argument("--java-home", type=Path)
+    ap.add_argument("--horizon-resources", type=Path, default=ROOT / ".local" / "horizon-client" / "26.3",
+                    help="a folder with Horizon's facts.json, for the registry check (read only: it is copied)")
+    ap.add_argument("--radius", type=int, default=6, help="chunks each way from 0, 0 in the world probe")
+    ap.add_argument("--no-world", action="store_true", help="skip the world probe")
     args = ap.parse_args()
 
     mc = args.minecraft.resolve()
@@ -126,20 +139,147 @@ def main() -> int:
 
     van, rus = lines("vanilla", "section"), lines("rust", "section")
     differ = [(a, b) for a, b in zip(van, rus) if a != b]
-    report = ["# P2 report", "",
+    report = ["# P2 report", "", "## Storage probe", "",
               f"- sections compared: {len(van)} (vanilla) / {len(rus)} (rust)",
               f"- sections that differ: {len(differ) + abs(len(van) - len(rus))}"]
     report += [f"  - vanilla: {a}\n  - rust:    {b}" for a, b in differ[:5]]
-    for prefix in ("rust checks", "storage equivalence", "rewritten sites"):
+    for prefix in ("rust checks", "storage equivalence", "light equivalence", "threads", "rewritten sites"):
         for l in lines("rust", prefix):
             report.append(f"- {l.replace(chr(9), ': ', 1).replace(chr(9), ', ')}")
     for mode in ("vanilla", "rust"):
         for l in lines(mode, "bench"):
             report.append(f"- {mode} run, {l.replace(chr(9), ': ')}")
+    ok = not differ and len(van) == len(rus)
+    ok &= all("wrong" not in l or l.rstrip().endswith(" 0 wrong") for l in lines("rust", "threads"))
+    ok &= all(l.split("\t")[1].startswith("identical") for l in lines("rust", "light equivalence"))
+
+    if not args.no_world:
+        world_ok, world_report = world(args, java, lib, jar, cp, out)
+        ok &= world_ok
+        report += ["", *world_report]
     text = "\n".join(report) + "\n"
     (out / "report.md").write_text(text, encoding="utf-8")
     print(text)
-    return 0 if not differ and len(van) == len(rus) else 1
+    return 0 if ok else 1
+
+
+FIELDS = ("blocks", "biomes", "block light", "sky light", "heightmaps", "saved")
+
+
+def chunk_fields(lines: list[str]) -> dict[str, dict[str, str]]:
+    """Each chunk's fields: {"0 0": {"blocks": hash, ...}}."""
+    chunks = {}
+    for line in lines:
+        if line.startswith("chunk\t"):
+            parts = line.split("\t")
+            chunks[parts[1]] = {p.rsplit(" ", 1)[0]: p.rsplit(" ", 1)[1] for p in parts[2:]}
+    return chunks
+
+
+def world(args, java: str, lib: Path, jar: Path, cp: list[Path], out: Path) -> tuple[bool, list[str]]:
+    """The world probe (see the module docstring)."""
+    facts = None
+    if (args.horizon_resources / "facts.json").exists():
+        # Loading the registry writes a cache beside facts.json: load a copy.
+        facts = out / "registry"
+        facts.mkdir(exist_ok=True)
+        shutil.copyfile(args.horizon_resources / "facts.json", facts / "facts.json")
+
+    def run(slug: str, mode: str, edits: int, start_from: str | None) -> list[str] | str:
+        run_dir = out / f"world-{slug}"
+        shutil.rmtree(run_dir, ignore_errors=True)
+        run_dir.mkdir(parents=True)
+        if start_from:
+            shutil.copytree(out / f"world-{start_from}" / "universe", run_dir / "universe")
+        result = out / f"world-{slug}.tsv"
+        result.unlink(missing_ok=True)
+        props = [f"-Dhz.mode={mode}", "-Dhz.world=normal", f"-Dhz.out={result}", f"-Dhz.radius={args.radius}",
+                 f"-Dhz.edits={edits}"]
+        if start_from:
+            props.append("-Dhz.keep=true")
+        if facts and mode == "rust":
+            props.append(f"-Dhz.facts={facts}")
+        cmd = [java, "-Xmx6g", "--enable-native-access=ALL-UNNAMED", f"-Dhz.lib={lib}", f"-javaagent:{jar}", *props,
+               "-Djava.awt.headless=true", "-cp", os.pathsep.join(map(str, [jar, *cp])), "net.minecraft.gametest.Main",
+               "--universe", str(run_dir / "universe")]
+        with open(out / f"world-{slug}.log", "w", encoding="utf-8") as log:
+            code = subprocess.run(cmd, cwd=run_dir, stdout=log, stderr=subprocess.STDOUT, timeout=3600).returncode
+        if code != 0 or not result.exists():
+            return f"the {slug} run failed (exit {code}); see {out / f'world-{slug}.log'}"
+        return read(result)
+
+    report = ["## World probe", ""]
+    plan = [("generated", "vanilla", 0, None),
+            ("vanilla", "vanilla", 40_000, "generated"),
+            ("vanilla-again", "vanilla", 40_000, "generated"),
+            ("rust", "rust", 40_000, "generated"),
+            ("rust-generated", "rust", 0, None),
+            ("vanilla-reads-rust", "vanilla", 0, "rust-generated"),
+            ("vanilla-reads-vanilla", "vanilla", 0, "generated")]
+    runs = {}
+    for slug, mode, edits, start_from in plan:
+        got = run(slug, mode, edits, start_from)
+        if isinstance(got, str):
+            return False, report + [f"- {got}"]
+        runs[slug] = got
+
+    ok = True
+
+    def inner(key: str, ring: int) -> bool:
+        x, z = map(int, key.split())
+        return -args.radius + ring <= x < args.radius - ring and -args.radius + ring <= z < args.radius - ring
+
+    def differing(base: str, other: str, field: str, keys) -> int:
+        a, b = chunk_fields(runs[base]), chunk_fields(runs[other])
+        return sum(1 for k in keys if a[k].get(field) != b.get(k, {}).get(field))
+
+    def compare(title: str, base: str, other: str, control: tuple[str, str], ring: int) -> None:
+        """Every field of `base` against `other`, skipping `ring` rings of chunks at the edge; `control` is the
+        same comparison with vanilla on both sides."""
+        nonlocal ok
+        a, b = chunk_fields(runs[base]), chunk_fields(runs[other])
+        keys = [k for k in a if inner(k, ring)]
+        edge = [k for k in a if not inner(k, ring)]
+        report.append(f"### {title}")
+        report.append("")
+        report.append(f"- chunks: {len(a)} / {len(b)}" + (f"; compared: the inner {len(keys)} (the outer {ring} rings"
+                      " are still generated and lit by their neighbours after the save is loaded, in vanilla too)"
+                      if ring else ""))
+        ok &= len(a) == len(b) > 0 and set(a) == set(b)
+        for field in FIELDS:
+            differ, vanilla = differing(base, other, field, keys), differing(*control, field, keys)
+            line = f"- {field}: {differ} chunks differ (vanilla, the same way: {vanilla})"
+            if ring:
+                line += (f"; at the edge {differing(base, other, field, edge)} "
+                         f"(vanilla: {differing(*control, field, edge)})")
+            report.append(line)
+            # A save loaded and saved again is not byte for byte the save it came from, in vanilla too (pending
+            # ticks count from each run's own clock, palettes come back in another order): there the save only
+            # has to differ no more than vanilla's own does.
+            ok &= differ == 0 or (field == "saved" and ring > 0 and vanilla > 0)
+        report.append("")
+
+    report.append(f"- {runs['rust'][1].replace(chr(9), ', ')}")
+    report.append("")
+    compare("Same saved world, edited, lit and saved: vanilla's memory against Rust's", "vanilla", "rust",
+            ("vanilla", "vanilla-again"), 0)
+    compare("World generated on Rust's memory, loaded back by vanilla", "rust-generated", "vanilla-reads-rust",
+            ("generated", "vanilla-reads-vanilla"), 2)
+    for slug in ("rust", "rust-generated"):
+        report.append(f"### Horizon on the live world ({slug} run)")
+        report.append("")
+        for prefix in ("sections", "light layers", "heightmaps", "horizon reads", "horizon writes", "registry"):
+            for line in runs[slug]:
+                if line.startswith(prefix + "\t"):
+                    report.append(f"- {line.replace(chr(9), ': ', 1).replace(chr(9), ', ')}")
+                    if prefix in ("horizon reads", "horizon writes", "registry"):
+                        ok &= all(p.endswith(" 0") for p in line.split("\t") if "wrong" in p)
+                    if prefix in ("sections", "light layers"):
+                        ok &= "other 0" in line
+        report.append("")
+    if not facts:
+        report.append(f"- registry: not checked (no facts.json in {args.horizon_resources})")
+    return ok, report
 
 
 if __name__ == "__main__":

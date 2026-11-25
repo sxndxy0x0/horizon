@@ -4,7 +4,7 @@ version = "0.1.0"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
-description = "P2 of docs/design/java-mods-everything.md: block storage Rust owns, read and written in place by vanilla Java code through FFM"
+description = "P2 of docs/design/java-mods-everything.md: block storage and light Rust owns, read and written in place by vanilla Java code through FFM"
 publish = false
 
 [lib]
@@ -12,6 +12,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 horizon-core = { path = "../horizon-core" }
+horizon-world = { path = "../horizon-world" }
 
 [lints]
 workspace = true

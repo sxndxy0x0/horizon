@@ -22,6 +22,7 @@ import net.minecraft.util.SimpleBitStorage;
 import net.minecraft.world.level.block.Block;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.chunk.DataLayer;
 import net.minecraft.world.level.chunk.Palette;
 import net.minecraft.world.level.chunk.PalettedContainer;
 import net.minecraft.world.level.chunk.Strategy;
@@ -88,12 +89,15 @@ public final class Probe {
                 rustMismatches += r[1];
             }
         }
+        // Before the checks only the Rust run makes, so both runs have done the same work when they measure.
+        out.add("bench container getAndSet+get\t" + benchContainer(strategy) + " ns/op");
         if (rust) {
             out.add("rust checks\t" + rustChecks + "\tmismatches " + rustMismatches);
             out.add("storage equivalence\t" + storageEquivalence());
+            out.add("light equivalence\t" + layerEquivalence());
+            out.add("threads\t" + threaded(strategy));
             out.add("rewritten sites\t" + Agent.REWRITTEN.get() + "\t" + String.join(",", Agent.SITES));
         }
-        out.add("bench container getAndSet+get\t" + benchContainer(strategy) + " ns/op");
         if (rust) {
             out.add("bench storage vanilla\t" + benchVanilla(new SimpleBitStorage(6, 4096)) + " ns/op");
             out.add("bench storage rust\t" + benchRust((RustBitStorage) RustBitStorage.create(6, 4096)) + " ns/op");
@@ -206,6 +210,128 @@ public final class Probe {
             }
         }
         return "identical in " + cases + " cases";
+    }
+
+    /**
+     * Random work on vanilla's DataLayer and on RustDataLayer side by side: every level, every flag, the bytes,
+     * the text forms and copies must match, and Rust, reading the layer's memory in place, must see the levels.
+     */
+    static String layerEquivalence() {
+        Random random = new Random(11L);
+        int cases = 0, rustReads = 0;
+        for (int c = 0; c < 96; c++) {
+            int start = c % 16;
+            byte[] bytes = new byte[2048];
+            random.nextBytes(bytes);
+            DataLayer v, r;
+            switch (c % 3) {
+                case 0 -> { v = new DataLayer(); r = RustDataLayer.create(); }
+                case 1 -> { v = new DataLayer(start); r = RustDataLayer.create(start); }
+                default -> { v = new DataLayer(bytes.clone()); r = RustDataLayer.create(bytes.clone()); }
+            }
+            for (int op = 0; op < 3000; op++) {
+                int x = random.nextInt(16), y = random.nextInt(16), z = random.nextInt(16), level = random.nextInt(16);
+                int what = random.nextInt(100);
+                if (what == 0) {
+                    v.fill(level);
+                    r.fill(level);
+                } else if (what == 1) {
+                    v = v.copy();
+                    r = r.copy();
+                } else if (what < 60) {
+                    v.set(x, y, z, level);
+                    r.set(x, y, z, level);
+                }
+                if (v.get(x, y, z) != r.get(x, y, z) || v.isEmpty() != r.isEmpty()
+                        || v.isDefinitelyHomogenous() != r.isDefinitelyHomogenous()
+                        || v.isDefinitelyFilledWith(level) != r.isDefinitelyFilledWith(level)) {
+                    return "differs in case " + c + " at op " + op;
+                }
+            }
+            if (!v.toString().equals(r.toString()) || !v.layerToString(3).equals(r.layerToString(3))) {
+                return "text forms differ in case " + c;
+            }
+            // getData makes the bytes in both (vanilla's own side effect), so it comes after the flags.
+            if (!java.util.Arrays.equals(v.getData(), r.getData())
+                    || !java.util.Arrays.equals(v.copy().getData(), r.copy().getData())) {
+                return "bytes differ in case " + c;
+            }
+            int[] levels = new int[4096];
+            for (int i = 0; i < 4096; i++) {
+                levels[i] = v.get(i & 15, i >> 8, i >> 4 & 15);
+            }
+            RustDataLayer rl = (RustDataLayer) r;
+            if (Rust.lightHash(rl.address()) != fnv(levels)) {
+                return "Rust reads other levels in case " + c;
+            }
+            rustReads++;
+            cases++;
+        }
+        return "identical in " + cases + " cases\tRust read " + rustReads + " layers in place, 0 wrong";
+    }
+
+    /**
+     * Eight threads at once, each with containers of its own (the game's rule: one thread per container), on
+     * Rust's memory: each ends with the cells it wrote, Rust reads them in place, and storages are freed by the
+     * Cleaner's thread meanwhile.
+     */
+    static String threaded(Strategy<BlockState> strategy) throws Exception {
+        int threads = 8;
+        int[] wrong = new int[threads];
+        int[] checks = new int[threads];
+        Thread[] running = new Thread[threads];
+        for (int t = 0; t < threads; t++) {
+            int me = t;
+            running[t] = new Thread(() -> {
+                Random random = new Random(1000L + me);
+                int registry = Block.BLOCK_STATE_REGISTRY.size();
+                for (int round = 0; round < 60; round++) {
+                    PalettedContainer<BlockState> c = new PalettedContainer<>(Blocks.AIR.defaultBlockState(), strategy);
+                    int[] expected = new int[4096];
+                    int distinct = DISTINCT[random.nextInt(DISTINCT.length)];
+                    int[] ids = new int[Math.min(distinct, 300)];
+                    for (int i = 0; i < ids.length; i++) {
+                        ids[i] = random.nextInt(registry);
+                    }
+                    for (int op = 0; op < 6000; op++) {
+                        int i = random.nextInt(4096);
+                        int id = ids[random.nextInt(ids.length)];
+                        c.set(i & 15, i >> 8, i >> 4 & 15, Block.stateById(id));
+                        expected[i] = id;
+                    }
+                    for (int i = 0; i < 4096; i++) {
+                        checks[me]++;
+                        if (Block.getId(c.get(i & 15, i >> 8, i >> 4 & 15)) != expected[i]) {
+                            wrong[me]++;
+                        }
+                    }
+                    try {
+                        BitStorage storage = (BitStorage) call(field(c, "data"), "storage");
+                        if (storage instanceof RustBitStorage rs) {
+                            int[] values = new int[4096];
+                            rs.unpack(values);
+                            checks[me]++;
+                            if (Rust.storageHash(rs.words(), rs.wordCount(), rs.getBits(), rs.getSize()) != fnv(values)) {
+                                wrong[me]++;
+                            }
+                        }
+                    } catch (Exception e) {
+                        wrong[me]++;
+                    }
+                    if (round % 10 == 0) {
+                        System.gc();
+                    }
+                }
+            });
+            running[t].start();
+        }
+        int all = 0, bad = 0;
+        for (int t = 0; t < threads; t++) {
+            running[t].join();
+            all += checks[t];
+            bad += wrong[t];
+        }
+        return threads + " threads, " + all + " checks, " + bad + " wrong";
     }
 
     static double benchContainer(Strategy<BlockState> strategy) {

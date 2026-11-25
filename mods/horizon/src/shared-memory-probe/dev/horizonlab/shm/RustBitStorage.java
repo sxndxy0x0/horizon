@@ -19,10 +19,16 @@ import org.apache.commons.lang3.Validate;
 public final class RustBitStorage extends SimpleBitStorage {
     private static final Cleaner CLEANER = Cleaner.create();
     private static final ValueLayout.OfLong WORD = ValueLayout.JAVA_LONG;
-    /** The words as a long array view: the access the JIT compiles to a plain load or store. */
-    private static final java.lang.invoke.VarHandle AT = WORD.arrayElementVarHandle();
+    /**
+     * A word read in place: Rust's words are always 8-byte aligned, so the access skips the alignment check the
+     * aligned layout makes on every read (the address is not a constant the JIT could check once).
+     */
+    private static final ValueLayout.OfLong AT = ValueLayout.JAVA_LONG_UNALIGNED;
 
+    /** This storage's words, for bulk copies. */
     private final MemorySegment words;
+    /** Their address in {@link Rust#ALL}: a word is one load from a constant segment, as from a heap array. */
+    private final long base;
     private final int count;
     private final int bits;
     private final long mask;
@@ -59,6 +65,7 @@ public final class RustBitStorage extends SimpleBitStorage {
             throw invalidLength(data.length, count);
         }
         this.words = Rust.alloc(count);
+        this.base = words.address();
         if (data != null) {
             MemorySegment.copy(data, 0, words, WORD, 0, count);
         }
@@ -104,12 +111,14 @@ public final class RustBitStorage extends SimpleBitStorage {
         return (int) ((index & 0xFFFFFFFFL) * divide >>> 32);
     }
 
+    // The index is checked against the size first, as vanilla checks it, so a cell is always one of this
+    // storage's words.
     private long word(int cell) {
-        return (long) AT.get(words, 0L, (long) cell);
+        return Rust.ALL.get(AT, base + ((long) cell << 3));
     }
 
     private void word(int cell, long value) {
-        AT.set(words, 0L, (long) cell, value);
+        Rust.ALL.set(AT, base + ((long) cell << 3), value);
     }
 
     @Override
