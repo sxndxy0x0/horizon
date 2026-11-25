@@ -264,10 +264,29 @@ def access_entries(zf: zipfile.ZipFile) -> list[tuple[str, str | None]]:
     return out
 
 
-def mod_facts(mods: Path) -> tuple[dict[str, str], dict[tuple[str, str | None], set[str]]]:
-    """Which mod jar holds each class (dotted), and which mods widen each vanilla class or member."""
+def coremod_targets(zf: zipfile.ZipFile) -> set[str]:
+    """The vanilla classes a jar's Forge coremods (META-INF/coremods.json -> JavaScript) name."""
+    names = set(zf.namelist())
+    if "META-INF/coremods.json" not in names:
+        return set()
+    try:
+        scripts = json.loads(zf.read("META-INF/coremods.json").decode("utf-8")).values()
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        return set()
+    out = set()
+    for script in scripts:
+        if script in names:
+            text = zf.read(script).decode("utf-8", "replace")
+            out |= {c.replace(".", "/") for c in re.findall(r"(?:net|com)[./]mojang[./][\w./$]+|net[./]minecraft[./][\w./$]+", text)}
+    return out
+
+
+def mod_facts(mods: Path) -> tuple[dict[str, str], dict[tuple[str, str | None], set[str]], dict[str, set[str]]]:
+    """Which mod jar holds each class (dotted), which mods widen each vanilla class or member, and which mods'
+    coremods name each vanilla class."""
     classes: dict[str, str] = {}
     access: dict[tuple[str, str | None], set[str]] = collections.defaultdict(set)
+    coremods: dict[str, set[str]] = collections.defaultdict(set)
     for jar in sorted(mods.glob("*.jar")):
         for zf in zips(jar):
             for name in zf.namelist():
@@ -275,7 +294,9 @@ def mod_facts(mods: Path) -> tuple[dict[str, str], dict[tuple[str, str | None], 
                     classes.setdefault(name[:-6].replace("/", "."), jar.name)
             for key in access_entries(zf):
                 access[key].add(jar.name)
-    return classes, access
+            for target in coremod_targets(zf):
+                coremods[target].add(jar.name)
+    return classes, access, coremods
 
 
 def read_tsv(path: Path) -> list[dict[str, str]]:
@@ -382,23 +403,42 @@ def check_patches(lines: list[str], status: dict[tuple[str, str], str], patches:
               f"- patches only (first 15): {', '.join(sorted(patched - found)[:15]) or 'none'}"]
 
 
+def attribute(key: tuple[str, str], mixins: str, status: str, fallback: str, classes: dict[str, str],
+              access: dict[tuple[str, str | None], set[str]], coremods: dict[str, set[str]],
+              vanilla: dict[tuple[str, str], dict[str, str]]) -> set[str]:
+    """Who changed a method, most certain first: the mixins merged into it or using their members; the mods
+    that widen it (access) or whose coremods name its class (code); the one mod all the mixins on its class
+    come from; the loader, for a method the loader itself added; else the fallback."""
+    named = [m for m in mixins.split(",") if m and not m.startswith("?")]
+    if named:
+        return {classes.get(m, "(mixin not in a mod jar: " + m + ")") for m in named}
+    if status == "access":
+        widened = access.get((key[0], key[1].split("(", 1)[0])) or access.get((key[0], None))
+        if widened:
+            return set(widened)
+    elif coremods.get(key[0]):
+        return set(coremods[key[0]])
+    candidates = {classes.get(m[1:], "(mixin not in a mod jar: " + m[1:] + ")") for m in mixins.split(",")
+                  if m.startswith("?")}
+    if len(candidates) == 1:
+        return candidates
+    if candidates:
+        return {"one of: " + ", ".join(sorted(candidates))}
+    if key not in vanilla:
+        # Not a vanilla method: the loader's own (Forge's enum create stubs, which its enum extender fills in).
+        return {"(the loader, on a method it added)"}
+    return {fallback}
+
+
 def report(out: Path, mods: Path, baseline: Path | None, patches: Path | None = None) -> None:
     """The loader against the vanilla jar, then the mods against the same loader without mods."""
-    classes, access = mod_facts(mods)
+    classes, access, coremods = mod_facts(mods)
     vanilla = methods(out / "vanilla.tsv")
     final = methods(out / "code.tsv")
     base = methods(baseline / "code.tsv") if baseline else None
 
     def owners(key: tuple[str, str], mixins: str, status: str, loader_label: str) -> set[str]:
-        found = {classes.get(m, "(mixin not in a mod jar: " + m + ")") for m in mixins.split(",") if m}
-        if found:
-            return found
-        if status == "access":
-            name = key[1].split("(", 1)[0]
-            widened = access.get((key[0], name)) or access.get((key[0], None))
-            if widened:
-                return set(widened)
-        return {loader_label}
+        return attribute(key, mixins, status, loader_label, classes, access, coremods, vanilla)
 
     lines = ["# Loader probe report", ""]
     lines += [f"- {k}: {v}" for k, v in read_summary(out).items()]

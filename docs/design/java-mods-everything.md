@@ -125,23 +125,32 @@
 
 - **ข้อค้นพบสำคัญ:** NeoForge สร้าง jar ของเกมใหม่ด้วยการ decompile แล้ว compile กลับ (`minecraft-client-patched`) bytecode เลยต่างจาก vanilla ถึง 86,812 method ทั้งที่ NeoForge แก้จริงแค่บางส่วน เช่น `ARGB.computeSrgbToLinear` ที่ NeoForge ไม่ได้แตะเลยก็ยังต่าง
   - **ผลต่อการออกแบบ:** baseline สำหรับม็อดต้องเป็น **loader ตัวเดียวกันที่ไม่ลงม็อด** ไม่ใช่ vanilla (ตัวทดลองรันสองรอบอัตโนมัติแล้ว)
-  - **การแก้ของ NeoForge เองหาได้จาก "สิ่งที่ method อ้างถึง":** เทียบการเรียก method, field, type และค่าคงที่แบบเรียงลำดับ แทนการเทียบคำสั่งตรง ๆ การ compile ใหม่จะย้ายตำแหน่ง branch แต่ไม่เปลี่ยนสิ่งที่อ้างถึง ส่วน patch จะเปลี่ยน ผลคือ method ที่ต่าง 86,812 ตัว ลดเหลือที่แก้จริง 2,186 ตัว (อีก 71,279 เป็นแค่ compile ใหม่) และไม่นับ lambda เพราะชื่อถูกเรียงเลขใหม่
-  - **ตรวจกับ source patch จริงของ NeoForge (850 ไฟล์ จาก branch `26.3.x`):** ตัวทดลองเจอ 96% ของคลาสที่มี patch ส่วนคลาสที่ตัวทดลองเจอแต่ไม่มีไฟล์ patch มี 244 คลาสที่เปลี่ยนแค่สิทธิ์การเข้าถึง (มาจาก access transformer ของ NeoForge เอง ไม่ได้อยู่ใน patch) และประมาณ 600 method ที่อาจเป็นสิ่งรบกวนจากการ compile ใหม่ หรือ coremod ของ NeoForge ตัวเลขนี้จึงเป็นขอบบน ฝั่งที่ปลอดภัย (อาจสั่งให้ Java รันเกินจำเป็น แต่ไม่ทำให้ม็อดพัง)
-- **ม็อดแก้เพิ่มจาก NeoForge 610 method** (นับใหม่หลังแยกการเปลี่ยนสิทธิ์ 48 ตัวออก) ระบุที่มาไม่ได้แค่ 1 ตัว: Lithium มากที่สุด ตามด้วย Sodium, ImmediatelyFast, Xaero, Architectury และ AE2
+  - **การแก้ของ NeoForge เองหาได้จาก "สิ่งที่ method อ้างถึง":** เทียบเซตของการเรียก method, field, type และ string ที่ method ใช้ แทนการเทียบคำสั่งตรง ๆ การ compile ใหม่จะย้าย branch แต่ไม่เปลี่ยนสิ่งที่อ้างถึง ส่วน patch จะเปลี่ยน
+    - **สิ่งที่ตัดทิ้งเพราะเป็นเศษจากการ compile ใหม่:** `Objects.requireNonNull` ที่ javac ใส่ให้เอง, `MatchException` ของ pattern switch, ตัวเลขคงที่ (ถูกพับรวมต่างกัน), จำนวนครั้งที่อ้างถึง (เปลี่ยนตาม `finally` ที่ถูกคัดลอก) และเลขของ lambda, anonymous class (`Outer$3`) และ `access$NNN`
+    - **lambda กับ method reference นับเป็นสิ่งที่มันเรียก:** `font::width` กับ `s -> this.font.width(s)` จึงเท่ากัน
+    - **ผล:** method ที่ต่าง 86,812 ตัว ลดเหลือที่แก้จริง 1,799 ตัว (อีก 71,665 เป็นแค่ compile ใหม่)
+  - **ตรวจกับ source patch จริงของ NeoForge (850 ไฟล์ จาก branch `26.3.x`) ด้วย `--loader-patches`:** ตัวทดลองเจอ **97.2%** ของคลาสที่มี patch ส่วนที่ตัวทดลองเจอแต่ไม่มีไฟล์ patch มี 217 คลาสที่เปลี่ยนแค่สิทธิ์การเข้าถึง (มาจาก access transformer ของ NeoForge เอง ไม่ได้อยู่ใน patch) และเศษจากการ compile ใหม่ **72 method (4%)** เศษที่เหลือต่างกันไปทุกตัว เช่น overload ที่เลือกต่างกัน (`writeByte(I)` กับ `writeByte(B)`), cast ที่เพิ่มเข้ามา และค่าที่ถูกแทนลงไปตรง ๆ (`val$range` กับ `Interval.INFINITE`) เศษพวกนี้อยู่ฝั่งปลอดภัย คือทำให้ Java รันเกินจำเป็น แต่ไม่ทำให้ม็อดพัง
+- **ม็อดแก้เพิ่มจาก NeoForge 610 method ระบุที่มาได้ครบทุกตัว** (แยกการเปลี่ยนสิทธิ์อีก 48 ตัวออกแล้ว) Lithium มากที่สุด ตามด้วย Sodium, ImmediatelyFast, Xaero, Architectury และ AE2 ตัวสุดท้ายที่เคยระบุไม่ได้คือ `Raider.<clinit>` ซึ่งเป็นของ Lithium ระบุได้เพราะ mixin ทุกตัวบนคลาสนั้นมาจากม็อดเดียว
 - **ระบบไฟและ network ไม่ถูกม็อดแตะเลย** redstone ถูกแตะแค่ 4 (Lithium) ส่วนม็อดเนื้อหาใหญ่อย่าง AE2 แตะ method vanilla แค่ 15 ตัว
 - **ตัดออกจากชุด:** Iris NeoForge 26.3 (1.11.7) ใช้ร่วมกับ Sodium รุ่นไหนก็ไม่ได้ จึงเอาออก และใช้ Sodium 0.9.3 แทน 0.9.4-beta.2
 
 ### Forge 26.3-66.1.9 (ม็อด 11 ตัว: Biomes O' Plenty, GlitchCore, TerraBlender, GeckoLib, Xaero's Minimap, Xaero's World Map, Collective, Mouse Tweaks, Sound Physics Remastered, Iceberg, Forge Config API Port)
 
-- **บูตผ่าน ไม่ล้มเลยสักคลาส** Forge ใช้ `net.minecraftforge.bootstrap.ForgeBootstrap` และแก้เกมด้วย binary patch ทีละคลาส คลาสที่แก้ถูก compile ใหม่ด้วย (มี 16,526 method ที่เป็นแค่ compile ใหม่)
-- **Forge แก้เกมเอง 1,287 method** ส่วนใหญ่อยู่ใน entity (305) และ block (145) ระบบไฟถูกแตะ 1 ตัว และ redstone ไม่ถูกแตะ
-- **ม็อดแก้เพิ่มจาก Forge 133 method** ระบุที่มาไม่ได้ 7 ตัว ส่วนการเปลี่ยนสิทธิ์ 425 ตัวระบุได้ครบ (access transformer แบบ wildcard `*()` นับเป็นทั้งคลาส) ระบบไฟ, redstone และ network ไม่ถูกม็อดแตะเลย
+- **บูตผ่าน ไม่ล้มเลยสักคลาส** Forge ใช้ `net.minecraftforge.bootstrap.ForgeBootstrap` และแก้เกมด้วย binary patch ทีละคลาส คลาสที่แก้ถูก compile ใหม่ด้วย (มี 16,611 method ที่เป็นแค่ compile ใหม่)
+- **Forge แก้เกมเอง 1,201 method** ส่วนใหญ่อยู่ใน entity และ block ระบบไฟถูกแตะ 1 ตัว และ redstone ไม่ถูกแตะ
+- **ม็อดแก้เพิ่มจาก Forge 133 method ระบุที่มาได้ครบ**
+  - 7 ตัวที่เคยระบุไม่ได้คือ `create(...)` ของ enum ที่ Forge เพิ่มเอง (`MobCategory`, `PathType`, `RecipeBookType` ฯลฯ) ซึ่งระบบขยาย enum ของ Forge เติมให้ จึงนับเป็นของ loader
+  - ตัวทดลองอ่าน coremod ของ Forge (`META-INF/coremods.json`) ด้วย ในแพ็กนี้ Xaero's Minimap มี coremod ที่แก้ `ToggleKeyMapping`
+  - การเปลี่ยนสิทธิ์ 425 ตัวระบุได้ครบ (access transformer แบบ wildcard `*()` นับเป็นทั้งคลาส)
+  - ระบบไฟ, redstone และ network ไม่ถูกม็อดแตะเลย
 - **ม็อด worldgen ขนาดใหญ่อย่าง Biomes O' Plenty แทบไม่แตะ method ของเกม** ตัวที่แตะ worldgen คือ TerraBlender (10)
 
 ### Quilt Loader 0.20.0-beta.9
 
 - **บูต 26.3 ไม่ได้ เป็นข้อจำกัดของ Quilt เอง ไม่ใช่ของตัวทดลอง:** Quilt ใช้ ASM 9.5 ซึ่งอ่านคลาสของ Java 25 (major version 69) ไม่ได้ จึงล้มตั้งแต่ `GameTransformer.locateEntrypoints` ก่อนโหลดม็อดใด ๆ และ QSL ก็ยังไม่มีรุ่นสำหรับ 26.3
 - **ผลต่อการออกแบบ:** ตอนนี้ผู้เล่น 26.3 ใช้ Quilt ไม่ได้ ไม่ว่าจะเป็นเกมจริงหรือ Horizon พอ Quilt ออกรุ่นที่รองรับแล้ว ให้รันตัวทดลองซ้ำด้วยคำสั่งเดิม
+
+**วิธีระบุที่มา เรียงจากแน่นอนที่สุด:** mixin ที่ merge เข้า method หรือที่ method ใช้ member ของมัน → access widener หรือ access transformer ของม็อด → coremod ของม็อด → mixin ทุกตัวบนคลาสมาจากม็อดเดียว → method ที่ loader เพิ่มเอง ถ้าไม่เข้าข้อไหนเลยจะขึ้นว่า "ระบุไม่ได้" ซึ่งในสามแพ็กตอนนี้เหลือ 0
 
 **สรุปสี่ตัว:** การเทียบกับ loader ที่ไม่ลงม็อดได้ผลทั้ง Fabric, NeoForge และ Forge จึงใช้เป็นวิธีหลักได้ ส่วน Quilt ยังรองรับ 26.3 ไม่ได้ ระบบไฟและ redstone ว่างให้ Rust เร่งได้ในทั้งสามแพ็ก ส่วนที่ถูกแตะมักเป็นม็อดเร่งความเร็ว (Lithium, C2ME, Sodium) ซึ่งเป็นงานที่ Horizon จะทำแทนอยู่แล้ว
 

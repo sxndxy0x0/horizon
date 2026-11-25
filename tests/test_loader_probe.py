@@ -36,6 +36,25 @@ class ClassifyTests(unittest.TestCase):
                          {("a/A", "m()V"): "changed", ("a/A", "lambda$m$0()V"): "added", ("a/A", "gone()V"): "removed"})
 
 
+class AttributeTests(unittest.TestCase):
+    def test_each_kind_of_evidence_names_its_owner(self):
+        classes = {"a.AMixin": "a.jar", "b.BMixin": "b.jar", "b.CMixin": "b.jar"}
+        access = {("net/X", "run"): {"aw.jar"}}
+        coremods = {"net/Y": {"core.jar"}}
+        vanilla = {("net/X", "run()V"): {}, ("net/Y", "go()V"): {}, ("net/Z", "f()V"): {}}
+
+        def who(key, mixins, status="changed"):
+            return probe.attribute(key, mixins, status, "(unattributed)", classes, access, coremods, vanilla)
+
+        self.assertEqual(who(("net/X", "run()V"), "a.AMixin,?b.BMixin"), {"a.jar"})
+        self.assertEqual(who(("net/X", "run()V"), "", "access"), {"aw.jar"})
+        self.assertEqual(who(("net/Y", "go()V"), ""), {"core.jar"})
+        self.assertEqual(who(("net/Z", "f()V"), "?b.BMixin,?b.CMixin"), {"b.jar"})
+        self.assertEqual(who(("net/Z", "f()V"), "?a.AMixin,?b.BMixin"), {"one of: a.jar, b.jar"})
+        self.assertEqual(who(("net/Z", "create(Ljava/lang/String;)V"), ""), {"(the loader, on a method it added)"})
+        self.assertEqual(who(("net/Z", "f()V"), ""), {"(unattributed)"})
+
+
 class ProfileTests(unittest.TestCase):
     def test_a_loader_profile_replaces_its_parents_library_of_the_same_artifact(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -69,7 +88,7 @@ class ModFactsTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "mod.jar").write_bytes(jar_bytes(outer))
-            classes, access = probe.mod_facts(Path(tmp))
+            classes, access, coremods = probe.mod_facts(Path(tmp))
         self.assertEqual(classes["dev.x.mixin.AMixin"], "mod.jar")
         self.assertEqual(set(access), {("net/minecraft/A", "run"), ("net/minecraft/B", None),
                                        ("net/minecraft/C", "tick"), ("net/minecraft/C", "speed"),

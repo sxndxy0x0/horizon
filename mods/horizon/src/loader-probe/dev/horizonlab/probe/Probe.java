@@ -133,7 +133,7 @@ public final class Probe {
         }
         for (MethodNode m : c.methods) {
             String who = mixins == null ? "" : String.join(",", mixins.behind(c, m, byKey));
-            out.write(c.name + "\t" + m.name + m.desc + "\t" + hash(code(m)) + "\t" + m.access + "\t" + hash(refs(m)) + "\t"
+            out.write(c.name + "\t" + m.name + m.desc + "\t" + hash(code(m)) + "\t" + m.access + "\t" + hash(refs(m, byKey, c.name)) + "\t"
                     + who + "\n");
         }
     }
@@ -179,7 +179,7 @@ public final class Probe {
                         scan(in.readAllBytes());
                     } else if (name.endsWith(".class")) {
                         classes.put(name.substring(0, name.length() - 6), in.readAllBytes());
-                    } else if (name.endsWith(".json") && !name.contains("/")) {
+                    } else if (name.endsWith(".json")) {
                         configs.add(new String(in.readAllBytes(), StandardCharsets.UTF_8));
                     }
                 }
@@ -272,6 +272,13 @@ public final class Probe {
                     out.add(ref.mixin());
                 }
             }
+            if (out.isEmpty()) {
+                // None of their members is used here (a renamed @Unique, a static initialiser's helper): every mixin on
+                // the class is a candidate, marked "?" for the report to narrow down by mod.
+                for (Ref ref : candidates) {
+                    out.add("?" + ref.mixin());
+                }
+            }
             return out;
         }
     }
@@ -325,49 +332,92 @@ public final class Probe {
     }
 
     /**
-     * What a method references, sorted: calls, field accesses, types and pooled constants, without branches, locals,
-     * line numbers, stack shapes or a lambda's synthetic name. Equal for a method a decompile-and-recompile moved around;
-     * different when a patch calls something else or adds a step.
+     * What a method references, as a set: calls, field accesses, types and string constants, with the bodies of the
+     * lambdas it creates folded in. Left out are branches, locals, line numbers, stack shapes, numeric constants, and
+     * the names a recompile renumbers (lambdas, anonymous classes, synthetic accessors). Equal for a method a
+     * decompile-and-recompile moved around; different when a patch calls or reads something new.
      */
-    static String refs(MethodNode m) {
-        List<String> out = new ArrayList<>();
+    static String refs(MethodNode m, Map<String, MethodNode> byKey, String owner) {
+        Set<String> out = new TreeSet<>();
+        collect(m, byKey, owner, out, new HashSet<>());
+        return String.join("|", out);
+    }
+
+    private static void collect(MethodNode m, Map<String, MethodNode> byKey, String owner, Set<String> out, Set<String> seen) {
+        if (!seen.add(m.name + m.desc)) {
+            return;
+        }
         for (AbstractInsnNode insn : m.instructions) {
-            String r = switch (insn) {
-                case MethodInsnNode c -> "M" + c.getOpcode() + c.owner + "." + c.name + c.desc;
-                case FieldInsnNode f -> "F" + f.getOpcode() + f.owner + "." + f.name;
-                case TypeInsnNode t -> "T" + t.getOpcode() + t.desc;
-                case LdcInsnNode l -> "L" + constant(l.cst);
-                case MultiANewArrayInsnNode a -> "A" + a.desc + a.dims;
-                case InvokeDynamicInsnNode d -> "D" + d.name + d.desc + indyArgs(d.bsmArgs);
-                // Stack shuffles, small constants, arithmetic and returns are left out: a recompile reshapes them
-                // (merged returns, ternaries), and a patch that changes behaviour nearly always calls or reads something.
-                default -> null;
-            };
-            if (r != null) {
-                out.add(r);
+            switch (insn) {
+                case MethodInsnNode c -> {
+                    // javac's null check on a qualified `new` or a method reference, and the default branch it adds to
+                    // a pattern switch: both come and go with a recompile.
+                    boolean noise = c.owner.equals("java/util/Objects") && c.name.equals("requireNonNull")
+                            || c.owner.equals("java/lang/MatchException");
+                    if (!noise) {
+                        out.add("M" + renumbered(c.owner) + "." + accessor(c.name) + c.desc);
+                    }
+                }
+                case FieldInsnNode f -> out.add("F" + f.getOpcode() + renumbered(f.owner) + "." + f.name);
+                case TypeInsnNode t -> {
+                    if (!t.desc.equals("java/lang/MatchException")) {
+                        out.add("T" + t.getOpcode() + renumbered(t.desc));
+                    }
+                }
+                case LdcInsnNode l -> {
+                    if (l.cst instanceof String s) {
+                        out.add("L" + s);
+                    } else if (l.cst instanceof Type t) {
+                        out.add("Ltype:" + renumbered(t.getDescriptor()));
+                    }
+                    // Numbers: a recompile folds or unfolds constant expressions (180F / (float) Math.PI).
+                }
+                case MultiANewArrayInsnNode a -> out.add("A" + a.desc + a.dims);
+                case InvokeDynamicInsnNode d -> indy(d, byKey, owner, out, seen);
+                default -> {
+                    // Stack shuffles, small constants, arithmetic and returns: a recompile reshapes them.
+                }
             }
         }
         for (TryCatchBlockNode block : m.tryCatchBlocks) {
             out.add("X" + block.type);
         }
-        out.sort(null);
-        return String.join("|", out);
     }
 
-    static String indyArgs(Object[] args) {
-        StringBuilder s = new StringBuilder();
-        for (Object a : args) {
-            s.append(',').append(a instanceof Handle h && h.getName().startsWith("lambda$")
-                    ? "lambda" + h.getDesc() : constant(a));
+    /**
+     * A lambda or method reference counts as what it calls, so {@code font::width} and {@code s -> this.font.width(s)}
+     * compare equal: a lambda of this class is folded in, any other target is a call. String concatenation counts as
+     * one step, its recipe being a constant a recompile may fold differently.
+     */
+    private static void indy(InvokeDynamicInsnNode d, Map<String, MethodNode> byKey, String owner, Set<String> out,
+            Set<String> seen) {
+        String bsm = d.bsm.getOwner();
+        if (bsm.equals("java/lang/invoke/LambdaMetafactory") && d.bsmArgs.length > 1 && d.bsmArgs[1] instanceof Handle impl) {
+            out.add("D" + d.name + Type.getReturnType(d.desc).getDescriptor());
+            MethodNode body = impl.getOwner().equals(owner) ? byKey.get(impl.getName() + impl.getDesc()) : null;
+            if (body != null && (impl.getName().startsWith("lambda$") || (body.access & org.objectweb.asm.Opcodes.ACC_SYNTHETIC) != 0)) {
+                collect(body, byKey, owner, out, seen);
+            } else {
+                out.add("M" + renumbered(impl.getOwner()) + "." + accessor(impl.getName()) + impl.getDesc());
+            }
+        } else if (bsm.equals("java/lang/invoke/StringConcatFactory")) {
+            out.add("Dconcat");
+        } else {
+            out.add("D" + bsm + "." + d.bsm.getName() + ":" + d.name);
         }
-        return s.toString();
     }
 
-    static String constant(Object c) {
-        return c instanceof Type t ? "type:" + t.getDescriptor() : c instanceof Handle h
-                ? h.getOwner() + "." + (h.getName().startsWith("lambda$") ? "lambda" : h.getName()) + h.getDesc()
-                : c.getClass().getSimpleName() + ":" + c;
+    /** {@code access$100}, a synthetic accessor whose number a recompile changes, as {@code access$}. */
+    static String accessor(String name) {
+        return name.startsWith("access$") && name.substring(7).chars().allMatch(Character::isDigit) ? "access$" : name;
     }
+
+    /** An anonymous class's number ({@code Outer$3}), which a recompile changes, as {@code Outer$#}. */
+    static String renumbered(String name) {
+        return ANONYMOUS.matcher(name).replaceAll("\\$#");
+    }
+
+    static final java.util.regex.Pattern ANONYMOUS = java.util.regex.Pattern.compile("\\$\\d+(?=$|[$;/])");
 
     static String hash(String text) {
         try {
