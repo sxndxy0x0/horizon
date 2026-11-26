@@ -239,4 +239,9 @@ final class WgpuEncoder implements CommandEncoderBackend {
         @Override
         public void close() {}
     }
+
+    /** NeoForge's addition to {@code CommandEncoderBackend} (vanilla's has none: no {@code @Override}). */
+    public void clearStencilTexture(GpuTexture texture, int value) {
+        Native.clearStencil(ctx(), tex(texture), value);
+    }
 }

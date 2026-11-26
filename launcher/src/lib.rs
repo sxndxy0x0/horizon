@@ -28,6 +28,7 @@ pub mod installer;
 pub mod instances;
 pub mod instances_mrpack;
 pub mod java;
+pub mod java_accel;
 pub mod java_launch;
 pub mod launch;
 pub mod loaders;

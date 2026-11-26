@@ -109,6 +109,7 @@
 2. ✅ **P2 หน่วยความจำร่วม:** บล็อก แสง และ heightmap ของเกม Java ตัวจริงอยู่บนหน่วยความจำของ Rust โลกจริงที่แก้แล้วให้แสงแล้วเซฟออกมาตรงกับ vanilla ทุก chunk และ `LevelAccess` ของ Horizon อ่านเขียนโลกที่กำลังรันอยู่ได้ตรง
 3. ✅ **P3 วาดภาพ:** Java client จริงวาดผ่าน backend wgpu ของ Horizon ทั้งหน้า title (ตรง OpenGL ทุก pixel) และในโลก (ต่างจาก OpenGL น้อยกว่าที่ Vulkan ของ Mojang ต่าง) เร็วกว่า Vulkan ของ Mojang เล็กน้อย และถอยไปใช้ backend ของเกมเองเมื่อ wgpu ใช้ไม่ได้
 4. ✅ **P4 accelerator ตัวแรก:** การกระจายแสงของเกมจริงรันใน Rust บนข้อมูลแสงของเกมเอง ผลตรง vanilla ทุก chunk ทั้งตอนแก้บล็อกและตอนให้แสงทั้งโลกใหม่ ฝั่ง client ภาพตรงด้วย และเร็วขึ้นราว 1.6 เท่า เปิดเฉพาะเมื่อคลาสระบบไฟทุกตัวเป็น bytecode ของ vanilla
+5. **P5 เข้าตัวม็อดจริง (กำลังทำ):** agent ของ Horizon สำหรับเกม Java จริง ที่ launcher ใส่ให้ Java instance ได้ (`instance java --accel light,wgpu`) ทำงานแล้วบน vanilla, Fabric และ NeoForge และถอยไปใช้ของเกมเองเมื่อม็อดแตะส่วนที่เร่ง เหลือส่งไฟล์ไปกับ launcher
 
 ## ผล P1 (2026-11-25)
 
@@ -483,6 +484,61 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
 - **`checkNode` และ `propagateLightSources` ยังเป็น Java:** สองอย่างนี้แค่ใส่งานลงคิว (`SkyLightEngine.propagateLightSources` เติมแสง 15 ทั้งคอลัมน์ตอนสร้าง chunk ด้วย) จึงเป็นส่วนเล็กของเวลา ย้ายมา Rust ได้ด้วยวิธีเดียวกันถ้าวัดแล้วคุ้ม
 - **ยังไม่ได้ตรวจ `LevelChunk.getBlockState`:** snapshot อ่าน section ตรง ๆ ข้ามเมธอดนี้ ม็อดที่แก้เมธอดนี้ (หรือโลก debug ของ vanilla ที่มีบล็อกพิเศษ) จะเห็นค่าต่างจากที่ระบบไฟของ Java เห็น
 - **ทั้งหมดยังอยู่ในตัวทดลอง P2/P4:** ยังไม่ได้ย้ายเข้าตัวม็อดจริง
+
+## P5 (2026-11-26): เข้าตัวม็อดจริง
+
+เป้าหมาย: ของที่ P2 ถึง P4 พิสูจน์ในตัวทดลอง ใช้ได้กับเกม Java ของผู้เล่นจริงทุก loader ผ่าน launcher
+
+ตัวทดลอง: `python tools/java_accel.py build` แล้ว `python tools/java_accel.py run --profile "Fabric 26.3" --world SAVE [--mods JAR...]`
+
+### โครงของ agent (`mods/horizon/src/accel/`)
+
+- **`boot/` (`dev.horizonlab.accel.boot`):** `Agent` (premain) และ `Rewrites` (การแก้ bytecode ทั้งหมดของ P2 และ P4) ไม่อ้างคลาสของเกมเลย รันบน system class loader
+- **`runtime/` (`dev.horizonlab.accel`, `dev.horizonlab.wgpu`):** คลาสที่อ้างเกม (`RustLight`, `RustDataLayer`, backend wgpu ...) อยู่ใน jar ใต้ `runtime/` ซึ่ง system loader มองไม่เห็น
+  - agent define คลาสเหล่านี้เข้า class loader ที่ define เกม (Knot ของ Fabric หรือ system loader ของ vanilla) ตอนที่แก้คลาสแรกที่จะเรียกเข้าไป เรียงให้ superclass มาก่อน
+  - ถ้าให้ system loader โหลด คลาสของเกมจะถูกโหลดซ้ำอีกชุด
+- **ตัวทดลอง P2, P3, P4 ใช้โค้ดชุดเดียวกันนี้:** คอมไพล์ `accel/` รวมกับคลาสทดลองของตัวเอง agent ของตัวทดลอง (`shm.Agent`) เรียก `Rewrites` แล้วเพิ่มแค่ hook ของการทดลอง
+- **ผลหลังย้าย:** ตัวทดลอง P4 ยังตรง vanilla 0/144 ทั้งสองแบบ และ P3 ยังตรง OpenGL ทุก pixel
+
+### สิ่งที่ loader จริงบังคับ (เจอระหว่างทาง)
+
+- **Knot ของ Fabric ไม่ให้โค้ดเกมเห็นคลาสบน class path:** (`can't load class ... hasn't been exposed to the game`) คลาส runtime จึงอ้างคลาส boot ไม่ได้ ข้อมูลที่ต้องแบ่งกัน (ผลตรวจ bytes) จึงฝากไว้ใน system properties เป็น map ของ JDK
+- **Fabric ไม่ยอมเริ่มถ้ามี ASM สองชุด:** agent จึงไม่ประกาศ ASM ใน manifest แต่ใช้ของ loader ถ้า class path มี และเติมชุดข้าง jar เฉพาะตอนไม่มี (vanilla)
+- **ต้องมี `-Xss1M -XX:StackShadowPages=32` ตาม version file:** ไม่มีแล้ว native code กิน stack จนเกมปิดเองไม่มี report (บทเรียนเดียวกับ P3) launcher ใส่ให้อยู่แล้วเพราะอ่าน version file
+- **ม็อดที่วาดด้วย OpenGL เอง (Sodium, Iris, TL Skin Cape):** กับ wgpu ไม่มี OpenGL context เกมจะล้มที่ call แรก ตอนเกมเลือก backend (`Backends.withWgpu`) agent จึงสแกน jar ใน `mods/` (รวม jar ที่ซ้อนข้างใน) ถ้ามีคลาสที่อ้าง `org/lwjgl/opengl/` จะไม่ใส่ wgpu และบอกเหตุผลใน log
+- **NeoForge เติม method ให้ interface ของ backend วาดภาพ:** `RenderPassBackend.setViewport(int, int, int, int)` และ `CommandEncoderBackend.clearStencilTexture(GpuTexture, int)` backend wgpu จึงมีทั้งสอง (ไม่ใส่ `@Override` เพราะคอมไพล์กับ vanilla) ทำตามที่ Vulkan backend ของ NeoForge ทำ
+- **NeoForge ใช้ `TransformingClassLoader` ใน module layer:** การ define คลาส runtime เข้า loader นั้นใช้ได้เลยโดยไม่ต้องแก้ module
+- **ตรวจแผนระดับ method:** Fabric API แก้ `LevelChunkSection` (นับอากาศแบบของตัวเอง) และ Sodium เติม method ให้ `PalettedContainer` ถ้าตรวจทั้งคลาส แสงจะไม่เร่งในแพ็กส่วนใหญ่ ตอนนี้ตรวจเฉพาะ method ที่ snapshot พึ่ง (`LevelChunkSection.getBlockState(III)`, `hasOnlyAir()`, `PalettedContainer.get`, `LevelChunk`/`ProtoChunk.getBlockState`) เทียบคำสั่งกับใน jar
+  - ส่วนโลก debug ของ vanilla (`getBlockState` สร้างบล็อกเอง) อ่านทีละ cell ผ่าน `getBlockState`
+
+### ผล (`tools/java_accel.py run` บนโลกจากตัวทดลอง P2)
+
+| profile และม็อด | วาดภาพ | แสง | เข้าโลก |
+|---|---|---|---|
+| vanilla 26.3 | wgpu (Vulkan) | Rust ทั้ง server และ client | ได้ |
+| Fabric 26.3 | wgpu (Vulkan) | Rust ทั้ง server และ client | ได้ |
+| Fabric 26.3 + Fabric API | wgpu (Vulkan) | Rust ทั้ง server และ client | ได้ |
+| Fabric 26.3 + Fabric API + C2ME | wgpu (Vulkan) | Java (C2ME แก้ `LayerLightSectionStorage`) | ได้ |
+| Fabric 26.3 + ม็อดทั้ง 22 ตัวในเครื่อง | OpenGL (Iris, Sodium, TL Skin Cape วาดเอง) | Java (C2ME) | ได้ |
+| NeoForge 26.3.0.118 | wgpu (Vulkan) | Rust ทั้ง server และ client | ได้ |
+
+### launcher
+
+- **`instance java <INSTANCE> --accel light,wgpu` (หรือ `off`):** เก็บใน `JavaGame.accel` ของ instance
+- **ตอนเริ่มเกม (`backend.rs` → `java_accel::jvm_args`):** ใส่ `--enable-native-access=ALL-UNNAMED`, `-javaagent:…/horizon-accel.jar` และ `-Dhorizon.accel=…` ก่อน JVM argument ของผู้เล่น
+  - เฉพาะเวอร์ชันที่ agent สร้างมาสำหรับ (26.3) และเมื่อ launcher มีไฟล์ของ agent (`java-accel/` ข้าง launcher หรือ `HORIZON_JAVA_ACCEL`)
+  - ไม่เข้าเงื่อนไขก็เริ่มเกมตามปกติ และบอกเหตุผลใน log ของการเปิดเกม
+
+### ที่ยังเหลือของ P5
+
+- **ส่งไฟล์ของ agent ไปกับ launcher:** (jar, ASM, ไลบรารี native) แนวทางคือทำแบบเดียวกับ exporter ของ `horizon-prepare`
+  - release ส่งเฉพาะคลาสของ Horizon เองที่คอมไพล์แล้ว ส่วน jar ของเกมยังเป็นของผู้เล่น
+  - ถ้า release ไม่มีชุดที่ตรงกับเวอร์ชัน launcher คอมไพล์บนเครื่องผู้เล่นด้วย JDK (`horizon_prepare::java::find`) กับ jar ของผู้เล่นเอง
+  - ไลบรารี native สร้างพร้อม launcher ตามปกติ
+- **Forge และ Quilt ยังไม่ได้ทดสอบ:** (Quilt บูต 26.3 ไม่ได้อยู่แล้ว ดู P1)
+- **ยังไม่ได้เทียบภาพหรือแสงแบบทีละ pixel/chunk ใต้ loader:** การทดสอบตอนนี้ดูว่าเร่งจริงและเล่นได้ ส่วนความตรงพิสูจน์ใน P3/P4 บน class path ธรรมดา
+- **หน้าตั้งค่าใน launcher:** ตอนนี้มีแค่ CLI
+- **ชื่อของไลบรารี native ยังเป็นของตัวทดลอง (`horizon_shm_probe`):** ควรแยก crate ของจริงออกมา
 
 ## เอาอะไรจาก forge/ari มาใช้
 

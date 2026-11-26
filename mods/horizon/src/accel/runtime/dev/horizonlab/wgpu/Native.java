@@ -34,7 +34,7 @@ final class Native {
     private static MethodHandle SAMPLER_CREATE, SAMPLER_FREE, PIPELINE_CREATE, PIPELINE_FREE, DEVICE,
             PIPELINE_ERROR;
     private static MethodHandle PASS_BEGIN, PASS_END, PASS_PIPELINE, PASS_BUFFER, PASS_TEXTURE, PASS_IMMEDIATES,
-            PASS_SCISSOR, PASS_VERTEX, PASS_INDEX, PASS_DRAW, PASS_DRAW_INDEXED, PASS_DRAW_FAN_INDEXED,
+            PASS_SCISSOR, PASS_VIEWPORT, CLEAR_STENCIL, PASS_VERTEX, PASS_INDEX, PASS_DRAW, PASS_DRAW_INDEXED, PASS_DRAW_FAN_INDEXED,
             PASS_MULTI_DRAW, PASS_DRAW_INDIRECT, TS_CREATE, TS_FREE, TS_WRITE, TS_READ;
     private static MethodHandle SURF_CREATE, SURF_FREE, SURF_CONFIGURE, SURF_MODES, SURF_ACQUIRE, SURF_SUBOPTIMAL,
             SURF_BLIT, SURF_PRESENT, DUMP_NEXT;
@@ -96,6 +96,8 @@ final class Native {
         PASS_TEXTURE = h("hz_pass_texture", null, P, I32, P, P);
         PASS_IMMEDIATES = h("hz_pass_immediates", null, P, P, I32);
         PASS_SCISSOR = h("hz_pass_scissor", null, P, I32, I32, I32, I32, I32);
+        PASS_VIEWPORT = h("hz_pass_viewport", null, P, I32, I32, I32, I32);
+        CLEAR_STENCIL = h("hz_clear_stencil", null, P, P, I32);
         PASS_VERTEX = h("hz_pass_vertex", null, P, I32, P, I64, I64);
         PASS_INDEX = h("hz_pass_index", null, P, P, I32);
         PASS_DRAW = h("hz_pass_draw", null, P, I32, I32, I32, I32);
@@ -480,6 +482,22 @@ final class Native {
         try (Arena arena = Arena.ofConfined()) {
             MemorySegment d = bytes(data, arena);
             PASS_IMMEDIATES.invokeExact(ctx, d, data.remaining());
+        } catch (Throwable t) {
+            throw fail(t);
+        }
+    }
+
+    static synchronized void passViewport(MemorySegment ctx, int x, int y, int w, int h) {
+        try {
+            PASS_VIEWPORT.invokeExact(ctx, x, y, w, h);
+        } catch (Throwable t) {
+            throw fail(t);
+        }
+    }
+
+    static synchronized void clearStencil(MemorySegment ctx, MemorySegment tex, int value) {
+        try {
+            CLEAR_STENCIL.invokeExact(ctx, tex, value);
         } catch (Throwable t) {
             throw fail(t);
         }

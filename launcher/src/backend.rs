@@ -2104,7 +2104,19 @@ pub fn java_game(
     }
     let version =
         crate::java_launch::resolve(crate::java_launch::read(&file(&start)?)?, &minecraft)?;
-    let jvm_args: Vec<String> = game.jvm_args.split_whitespace().map(String::from).collect();
+    // Horizon's accelerators first, so the player's own arguments can still change what they set.
+    let mut jvm_args = match crate::java_accel::jvm_args(
+        &game.accel,
+        &game.minecraft,
+        crate::java_accel::dir().as_deref(),
+    ) {
+        Ok(args) => args,
+        Err(why) => {
+            log(why);
+            Vec::new()
+        }
+    };
+    jvm_args.extend(game.jvm_args.split_whitespace().map(String::from));
     fs::create_dir_all(&instance.home).map_err(|e| format!("{}: {e}", instance.home.display()))?;
     crate::java_launch::command(
         &version,

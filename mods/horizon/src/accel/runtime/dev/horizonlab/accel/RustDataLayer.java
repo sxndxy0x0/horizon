@@ -1,4 +1,4 @@
-package dev.horizonlab.shm;
+package dev.horizonlab.accel;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -172,22 +172,22 @@ public final class RustDataLayer extends DataLayer {
     }
 
     // For the probes: the memory Rust owns, 0 while the layer holds only its default level.
-    long address() {
+    public long address() {
         Bytes b = bytes;
         return b == null ? 0L : b.base;
     }
 
-    int defaultLevel() {
+    public int defaultLevel() {
         return defaultValue;
     }
 
     /** The address of the bytes, made now if the layer held only its default level (as a {@code set} would). */
-    long writable() {
+    public long writable() {
         return materialize().base;
     }
 
     /** Keeps the bytes reachable while Rust reads them. */
-    Object holder() {
+    public Object holder() {
         return bytes;
     }
 }

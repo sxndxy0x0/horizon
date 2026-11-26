@@ -36,6 +36,8 @@ sys.path.insert(0, str(ROOT / "tools"))
 import loader_probe  # noqa: E402
 
 SRC = ROOT / "mods" / "horizon" / "src" / "shared-memory-probe"
+# The product code the probe runs (the Horizon agent's boot and runtime classes): see tools/java_accel.py.
+ACCEL = ROOT / "mods" / "horizon" / "src" / "accel"
 
 
 def client_jar(versions: Path, version: str) -> Path:
@@ -69,7 +71,7 @@ def build_jar(java_home: Path | None, cp: list[Path], out: Path) -> Path:
     shutil.rmtree(classes, ignore_errors=True)
     classes.mkdir(parents=True)
     subprocess.run([javac, "--release", "25", "-nowarn", "-cp", os.pathsep.join(map(str, cp)), "-d", str(classes),
-                    *map(str, SRC.rglob("*.java"))], check=True)
+                    *map(str, SRC.rglob("*.java")), *map(str, ACCEL.rglob("*.java"))], check=True)
     manifest = out / "build" / "MANIFEST.MF"
     manifest.write_text("Premain-Class: dev.horizonlab.shm.Agent\n", encoding="utf-8")
     jar = out / "build" / "shm-probe.jar"

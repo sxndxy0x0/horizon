@@ -29,6 +29,8 @@ import loader_probe  # noqa: E402
 import shared_memory_probe  # noqa: E402
 
 SRC = ROOT / "mods" / "horizon" / "src" / "wgpu-backend"
+# The product code the probe runs (the Horizon agent's boot and runtime classes): see tools/java_accel.py.
+ACCEL = ROOT / "mods" / "horizon" / "src" / "accel"
 
 OPTIONS = """onboardAccessibility:false
 panoramaScrollSpeed:0.0
@@ -71,7 +73,7 @@ def build_jar(java_home: Path | None, cp: list[Path], out: Path) -> Path:
     shutil.rmtree(classes, ignore_errors=True)
     classes.mkdir(parents=True)
     subprocess.run([javac, "--release", "25", "-nowarn", "-cp", os.pathsep.join(map(str, cp)), "-d", str(classes),
-                    *map(str, SRC.rglob("*.java"))], check=True)
+                    *map(str, SRC.rglob("*.java")), *map(str, ACCEL.rglob("*.java"))], check=True)
     manifest = out / "build" / "MANIFEST.MF"
     manifest.write_text("Premain-Class: dev.horizonlab.wgpu.Agent\n", encoding="utf-8")
     jar = out / "build" / "wgpu-backend.jar"

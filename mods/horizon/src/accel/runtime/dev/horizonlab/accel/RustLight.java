@@ -1,4 +1,4 @@
-package dev.horizonlab.shm;
+package dev.horizonlab.accel;
 
 import it.unimi.dsi.fastutil.longs.LongArrayFIFOQueue;
 import it.unimi.dsi.fastutil.longs.LongSet;
@@ -56,22 +56,52 @@ import net.minecraft.world.phys.shapes.VoxelShape;
  * light is on in a column, and whether two occlusion faces occlude.
  */
 public final class RustLight {
-    static final String MODE = System.getProperty("hz.light", "");
-    static final boolean ACCEL = MODE.equals("accel");
+    public static final String MODE = System.getProperty("hz.light", "");
+    public static final boolean ACCEL = MODE.equals("accel");
     /** The classes the agent checked, and whether each was defined with vanilla's bytes (see {@link LightNames}). */
-    static final Map<String, Boolean> VANILLA = LightNames.VANILLA_BYTES;
-    static final String[] GUARDED = LightNames.GUARDED;
+    public static final Map<String, Boolean> VANILLA = vanilla();
+    /** The classes the agent guards (its {@code LightNames.GUARDED}; this class cannot see that one under Knot). */
+    public static final String[] GUARDED = {
+        "net/minecraft/world/level/lighting/LightEngine",
+        "net/minecraft/world/level/lighting/BlockLightEngine",
+        "net/minecraft/world/level/lighting/SkyLightEngine",
+        "net/minecraft/world/level/lighting/LayerLightSectionStorage",
+        "net/minecraft/world/level/lighting/SkyLightSectionStorage",
+        "net/minecraft/world/level/lighting/BlockLightSectionStorage",
+        "net/minecraft/world/level/lighting/DataLayerStorageMap",
+        // What the block snapshots (RustLight.snapshot) read, past LightChunk.getBlockState, by method: loaders and
+        // mods add to these classes (Fabric API counts air its own way, Sodium unpacks containers), which is fine.
+        "net/minecraft/world/level/chunk/LevelChunkSection.getBlockState(III)Lnet/minecraft/world/level/block/state/BlockState;",
+        "net/minecraft/world/level/chunk/LevelChunkSection.hasOnlyAir()Z",
+        "net/minecraft/world/level/chunk/PalettedContainer.get(III)Ljava/lang/Object;",
+        "net/minecraft/world/level/chunk/PalettedContainer.get(I)Ljava/lang/Object;",
+        "net/minecraft/world/level/chunk/LevelChunk.getBlockState(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/block/state/BlockState;",
+        "net/minecraft/world/level/chunk/ProtoChunk.getBlockState(Lnet/minecraft/core/BlockPos;)Lnet/minecraft/world/level/block/state/BlockState;",
+    };
 
-    static final AtomicLong RUNS = new AtomicLong();
-    static final AtomicLong NANOS = new AtomicLong();
-    static final AtomicLong ENTRIES = new AtomicLong();
-    static final AtomicLong SNAPSHOTS = new AtomicLong();
-    static final AtomicLong CONVERTED = new AtomicLong();
-    static final AtomicLong JAVA_RUNS = new AtomicLong();
+    /** The agent's verdicts (its {@code LightNames.VANILLA_BYTES}, kept in the system properties to be shared). */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Boolean> vanilla() {
+        synchronized (System.getProperties()) {
+            Object m = System.getProperties().get("horizon.accel.vanilla");
+            if (m == null) {
+                m = new ConcurrentHashMap<String, Boolean>();
+                System.getProperties().put("horizon.accel.vanilla", m);
+            }
+            return (Map<String, Boolean>) m;
+        }
+    }
+
+    public static final AtomicLong RUNS = new AtomicLong();
+    public static final AtomicLong NANOS = new AtomicLong();
+    public static final AtomicLong ENTRIES = new AtomicLong();
+    public static final AtomicLong SNAPSHOTS = new AtomicLong();
+    public static final AtomicLong CONVERTED = new AtomicLong();
+    public static final AtomicLong JAVA_RUNS = new AtomicLong();
     /** Time in the upcalls, by kind: layers, blocks (snapshots made). */
-    static final AtomicLong LAYER_NANOS = new AtomicLong();
-    static final AtomicLong BLOCK_NANOS = new AtomicLong();
-    static final AtomicLong UPCALLS = new AtomicLong();
+    public static final AtomicLong LAYER_NANOS = new AtomicLong();
+    public static final AtomicLong BLOCK_NANOS = new AtomicLong();
+    public static final AtomicLong UPCALLS = new AtomicLong();
 
     private static final Cleaner CLEANER = Cleaner.create();
     private static final Linker LINKER = Linker.nativeLinker();
@@ -130,11 +160,11 @@ public final class RustLight {
                     .findVirtual(map, "copyDataLayer", MethodType.methodType(DataLayer.class, long.class));
             LOWEST_Y = MethodHandles.privateLookupIn(skyMap, LOOKUP).findVarHandle(skyMap, "currentLowestY", int.class);
             SECTION_LIGHT = MethodHandles.privateLookupIn(LevelChunkSection.class, LOOKUP)
-                    .findVarHandle(LevelChunkSection.class, Agent.SECTION_LIGHT, long.class);
+                    .findVarHandle(LevelChunkSection.class, dev.horizonlab.accel.boot.Rewrites.SECTION_LIGHT, long.class);
             SECTION_VERSION = MethodHandles.privateLookupIn(LevelChunkSection.class, LOOKUP)
-                    .findVarHandle(LevelChunkSection.class, Agent.SECTION_VERSION, int.class);
+                    .findVarHandle(LevelChunkSection.class, dev.horizonlab.accel.boot.Rewrites.SECTION_VERSION, int.class);
             Class<?> base = Class.forName("net.minecraft.world.level.block.state.BlockBehaviour$BlockStateBase");
-            STATE_CLASS = MethodHandles.privateLookupIn(base, LOOKUP).findVarHandle(base, Agent.STATE_CLASS, int.class);
+            STATE_CLASS = MethodHandles.privateLookupIn(base, LOOKUP).findVarHandle(base, dev.horizonlab.accel.boot.Rewrites.STATE_CLASS, int.class);
             Class<?> data = Class.forName("net.minecraft.world.level.chunk.PalettedContainer$Data");
             CONTAINER_DATA = MethodHandles.privateLookupIn(PalettedContainer.class, LOOKUP)
                     .findVarHandle(PalettedContainer.class, "data", data);
@@ -177,7 +207,7 @@ public final class RustLight {
      * Whether Rust may run the propagation: accelerating, every guarded class vanilla's own, and every block state's
      * light class fitting the snapshots' byte ({@link #allClassesFit}).
      */
-    static boolean rustRuns() {
+    public static boolean rustRuns() {
         if (!ACCEL) {
             return false;
         }
@@ -196,7 +226,7 @@ public final class RustLight {
      * runs), once: no class is named after this, so a snapshot's byte a block can hold 256 classes. A game with
      * more keeps Java's propagation.
      */
-    static boolean allClassesFit() {
+    public static boolean allClassesFit() {
         Boolean f = fit;
         if (f == null) {
             globalClasses();
@@ -234,6 +264,16 @@ public final class RustLight {
         long start = System.nanoTime();
         int count;
         if (!rustRuns()) {
+            if (ACCEL && JAVA_RUNS.get() == 0) {
+                // Once: why light stays the game's own.
+                java.util.List<String> changed = new java.util.ArrayList<>();
+                for (String c : GUARDED) {
+                    if (!Boolean.TRUE.equals(VANILLA.get(c))) {
+                        changed.add(c + (VANILLA.containsKey(c) ? "" : " (not loaded)"));
+                    }
+                }
+                System.out.println("[shm] light stays Java: changed by a loader or mod: " + changed);
+            }
             count = (int) PROPAGATE_DECREASES.invoke(engine) + (int) PROPAGATE_INCREASES.invoke(engine);
             JAVA_RUNS.incrementAndGet();
         } else {
@@ -299,7 +339,7 @@ public final class RustLight {
     // -- Upcalls -------------------------------------------------------------------------------------------------
 
     /** See {@code Callbacks.layer} in light.rs. */
-    static long layer(long section, int write) {
+    public static long layer(long section, int write) {
         long t0 = System.nanoTime();
         UPCALLS.incrementAndGet();
         try {
@@ -341,7 +381,7 @@ public final class RustLight {
     }
 
     /** See {@code Callbacks.blocks} in light.rs. */
-    static long blocks(long section) {
+    public static long blocks(long section) {
         long t0 = System.nanoTime();
         UPCALLS.incrementAndGet();
         try {
@@ -353,7 +393,10 @@ public final class RustLight {
             if (chunk == null) {
                 return -1;
             }
-            if (!(chunk instanceof ChunkAccess access)) {
+            if (!(chunk instanceof ChunkAccess access)
+                    || chunk instanceof net.minecraft.world.level.chunk.LevelChunk lc && lc.getLevel().isDebug()) {
+                // LightEngine.getState asks the chunk: a chunk of another kind, or the debug world's (whose
+                // getBlockState makes its blocks up), is read the same way, cell by cell.
                 return copy(chunk, sx, sy, sz);
             }
             int index = access.getSectionIndexFromSectionY(sy);
@@ -369,7 +412,7 @@ public final class RustLight {
         }
     }
 
-    static int lightOn(long section) {
+    public static int lightOn(long section) {
         try {
             return (boolean) LIGHT_ON.invoke(CURRENT.get().storage, section) ? 1 : 0;
         } catch (Throwable t) {
@@ -377,7 +420,7 @@ public final class RustLight {
         }
     }
 
-    static int occludes(int a, int b) {
+    public static int occludes(int a, int b) {
         return Shapes.faceShapeOccludes(FACES.get(a), FACES.get(b)) ? 1 : 0;
     }
 
@@ -403,7 +446,7 @@ public final class RustLight {
      * filled again until no set came in while it was being filled, and a set after it is published writes the
      * snapshot itself.
      */
-    static long snapshot(LevelChunkSection s) {
+    public static long snapshot(LevelChunkSection s) {
         long at = (long) SECTION_LIGHT.getVolatile(s);
         if (at != 0) {
             return at;
@@ -510,8 +553,8 @@ public final class RustLight {
     private static final List<VoxelShape> FACES = new java.util.concurrent.CopyOnWriteArrayList<>();
     private static final Map<VoxelShape, Integer> FACE_IDS = new IdentityHashMap<>();
     private static final Map<List<Integer>, Integer> CLASS_IDS = new HashMap<>();
-    static final int AIR;
-    static final int BEDROCK;
+    public static final int AIR;
+    public static final int BEDROCK;
 
     static {
         FACES.add(Shapes.empty());
@@ -536,7 +579,7 @@ public final class RustLight {
      * counts, its occlusion face each way), named the first time a state is met and kept in the field the agent
      * adds to {@code BlockStateBase} (the class plus one; 0 while unnamed).
      */
-    static int classOf(BlockState state) {
+    public static int classOf(BlockState state) {
         int c = (int) STATE_CLASS.get(state);
         if (c != 0) {
             return c - 1;
@@ -580,7 +623,7 @@ public final class RustLight {
     }
 
     /** For the world probe's output. */
-    static String report() {
+    public static String report() {
         return "light\t" + MODE + "\truns " + RUNS.get() + "\tjava runs " + JAVA_RUNS.get() + "\tentries " + ENTRIES.get()
                 + "\tms " + NANOS.get() / 1_000_000 + "\tlayer upcalls ms " + LAYER_NANOS.get() / 1_000_000
                 + "\tblock upcalls ms " + BLOCK_NANOS.get() / 1_000_000 + "\trust ms " + rustMillis() + "\tupcalls " + UPCALLS.get() + "\tsnapshots " + SNAPSHOTS.get() + "\tclasses " + CLASS_IDS.size()

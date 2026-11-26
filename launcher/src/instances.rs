@@ -220,6 +220,9 @@ pub struct JavaGame {
     /// The game window's size, width then height; none: the game's own 854×480.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<(u32, u32)>,
+    /// Horizon's accelerators it starts with ([`crate::java_accel`]): `light`, `wgpu`; none: the game as it is.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accel: Vec<String>,
 }
 
 impl Instance {

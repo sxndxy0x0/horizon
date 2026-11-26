@@ -3110,6 +3110,76 @@ pub unsafe extern "C" fn hz_pass_immediates(ctx: *mut Ctx, data: *const u8, len:
     })
 }
 
+/// NeoForge's `RenderPassBackend.setViewport` (vanilla's backend has none): the viewport within the render area,
+/// as NeoForge's Vulkan backend sets it (the rows the game keeps, as everywhere here), depths 0 to 1.
+///
+/// # Safety
+/// `ctx` is live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hz_pass_viewport(ctx: *mut Ctx, x: i32, y: i32, w: i32, h: i32) {
+    guard(ctx, (), |ctx| {
+        let pass = pass(ctx)?;
+        let (ax, ay, aw, ah) = pass.area;
+        // wgpu takes no viewport past the target: within the render area.
+        let x0 = (x.max(0) as u32).clamp(ax, ax + aw);
+        let y0 = (y.max(0) as u32).clamp(ay, ay + ah);
+        let x1 = ((x + w).max(0) as u32).clamp(x0, ax + aw);
+        let y1 = ((y + h).max(0) as u32).clamp(y0, ay + ah);
+        pass.pass.set_viewport(
+            x0 as f32,
+            y0 as f32,
+            (x1 - x0).max(1) as f32,
+            (y1 - y0).max(1) as f32,
+            0.0,
+            1.0,
+        );
+        Ok(())
+    })
+}
+
+/// NeoForge's `CommandEncoderBackend.clearStencilTexture`: a depth-stencil texture's stencil set to `value`, its
+/// depth kept. Nothing for a format without stencil.
+///
+/// # Safety
+/// `ctx` and `tex` are live.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hz_clear_stencil(ctx: *mut Ctx, tex: *mut Tex, value: u32) {
+    guard(ctx, (), |ctx| {
+        ctx.no_pass("clearStencilTexture")?;
+        // SAFETY: as the caller promises.
+        let tex = unsafe { &*tex };
+        if !tex.format.has_stencil_aspect() {
+            return Ok(());
+        }
+        let view = tex.texture.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(wgpu::TextureViewDimension::D2),
+            base_mip_level: 0,
+            mip_level_count: Some(1),
+            base_array_layer: 0,
+            array_layer_count: Some(1),
+            ..Default::default()
+        });
+        let encoder = ctx.encoder();
+        drop(encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("horizon stencil clear"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(value),
+                    store: wgpu::StoreOp::Store,
+                }),
+            }),
+            ..Default::default()
+        }));
+        Ok(())
+    })
+}
+
 /// A scissor rectangle within the render area; `w` 0 (and `h` 0): the render area itself.
 ///
 /// # Safety

@@ -261,6 +261,9 @@ enum InstanceCmd {
         /// The game window's size, as 1280x720; "default" goes back to the game's own
         #[arg(long)]
         window: Option<String>,
+        /// Horizon's accelerators to start it with: light, wgpu (comma-separated) or off (docs/design/java-mods-everything.md)
+        #[arg(long)]
+        accel: Option<String>,
     },
     /// A Java instance's mod loader: fabric, quilt, forge or neoforge, or none. --list shows its versions
     Loader {
@@ -2909,8 +2912,13 @@ fn instance(action: InstanceCmd, as_json: bool) -> Result<(), String> {
             memory,
             args,
             window,
+            accel,
         } => {
             let window = window.as_deref().map(parse_window).transpose()?;
+            let accel = accel
+                .as_deref()
+                .map(horizon_launcher::java_accel::parse)
+                .transpose()?;
             if instances::find(&instance)?.java.is_none() {
                 return Err(format!(
                     "{instance} is a Horizon instance: Horizon is not a Java program."
@@ -2928,6 +2936,9 @@ fn instance(action: InstanceCmd, as_json: bool) -> Result<(), String> {
                 }
                 if let Some(window) = window {
                     java.window = window;
+                }
+                if let Some(accel) = accel {
+                    java.accel = accel;
                 }
             })?)
         }

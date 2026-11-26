@@ -240,4 +240,9 @@ final class WgpuRenderPass implements RenderPassBackend {
     public void writeTimestamp(GpuQueryPool pool, int index) {
         ((WgpuQueryPool) pool).write(index);
     }
+
+    /** NeoForge's addition to {@code RenderPassBackend} (vanilla's has none: no {@code @Override}). */
+    public void setViewport(int x, int y, int width, int height) {
+        Native.passViewport(ctx, x, y, width, height);
+    }
 }

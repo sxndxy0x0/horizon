@@ -1,5 +1,7 @@
 package dev.horizonlab.shm;
 
+import dev.horizonlab.accel.*;
+
 import java.io.BufferedWriter;
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;

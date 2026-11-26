@@ -8,6 +8,7 @@ import java.util.ArrayList;
 import java.util.Deque;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
+import dev.horizonlab.accel.boot.Rewrites;
 import org.objectweb.asm.ClassReader;
 import org.objectweb.asm.ClassWriter;
 import java.util.Map;
@@ -29,35 +30,20 @@ import org.objectweb.asm.tree.MethodNode;
 import org.objectweb.asm.tree.TypeInsnNode;
 
 /**
- * Puts the game's block storage and light in Rust's memory: every {@code new SimpleBitStorage(...)} in the game's
- * classes becomes {@code RustBitStorage.create(...)}, and every {@code new DataLayer(...)} (method references
- * {@code DataLayer::new} included) becomes {@code RustDataLayer.create(...)}; each returns the vanilla type, over
- * memory Rust owns. Loader-neutral like the loader probe's agent: it works on the bytes any loader defines.
- *
- * <p>For the live-world run ({@code -Dhz.world=...}) it also hands each game-test server tick to {@link World}.
+ * The probes' agent for P2 and P4: the product's edits ({@link Rewrites}: block storage and light in Rust's memory,
+ * light propagated by Rust), on the plain class path the probes run the game from, plus the probes' own hooks: the
+ * live-world run ({@code -Dhz.world=...}, each game-test server tick handed to {@link World}), the kept save
+ * ({@code hz.keep}) and the relight test ({@code hz.relight}).
  */
 public final class Agent {
-    static final String STORAGE = "net/minecraft/util/SimpleBitStorage";
-    static final String RUST = "dev/horizonlab/shm/RustBitStorage";
-    static final String LAYER = "net/minecraft/world/level/chunk/DataLayer";
-    static final String RUST_LAYER = "dev/horizonlab/shm/RustDataLayer";
-    /** Each vanilla class the game constructs, and the factory that stands in for its constructors. */
-    static final Map<String, String> FACTORIES = Map.of(STORAGE, RUST, LAYER, RUST_LAYER);
     static final String TEST_SERVER = "net/minecraft/gametest/framework/GameTestServer";
     static final String TEST_MAIN = "net/minecraft/gametest/framework/GameTestMainUtil";
+    static final String CHUNK_DATA = "net/minecraft/world/level/chunk/storage/SerializableChunkData";
     /** Whether the game's storage and light go to Rust's memory: not in the vanilla run of the world probe. */
-    static final boolean STORE = !"vanilla".equals(System.getProperty("hz.mode"));
-    static final AtomicInteger REWRITTEN = new AtomicInteger();
-    /** P4 ({@link RustLight}): {@code hz.light} is {@code accel} (Rust propagates light) or {@code time}. */
-    static final String LIGHT = System.getProperty("hz.light");
-    static final String ENGINE = "net/minecraft/world/level/lighting/LightEngine";
-    static final String SECTION = "net/minecraft/world/level/chunk/LevelChunkSection";
-    static final String STATE_BASE = "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase";
-    /** The fields the agent adds: a section's light-class snapshot and its version, a state's light class. */
-    static final String SECTION_LIGHT = "hz$light";
-    static final String SECTION_VERSION = "hz$version";
-    static final String STATE_CLASS = "hz$lightClass";
-    static final List<String> SITES = new ArrayList<>();
+    static final boolean STORE = Rewrites.memory();
+    static final String LIGHT = Rewrites.light();
+    static final java.util.concurrent.atomic.AtomicInteger REWRITTEN = Rewrites.REWRITTEN;
+    static final List<String> SITES = Rewrites.SITES;
 
     private Agent() {}
 
@@ -66,50 +52,18 @@ public final class Agent {
             @Override
             public byte[] transform(ClassLoader loader, String name, Class<?> redefined, ProtectionDomain domain,
                     byte[] bytes) {
-                if (name == null || !name.startsWith("net/minecraft/") || FACTORIES.containsKey(name)) {
+                if (name == null || !name.startsWith("net/minecraft/")) {
                     return null;
                 }
-                if (LIGHT != null && java.util.Arrays.asList(LightNames.GUARDED).contains(name)) {
-                    LightNames.VANILLA_BYTES.put(name, sameAsJar(domain, name, bytes));
-                }
+                Rewrites.guard(domain, name, bytes);
                 try {
-                    return rewrite(bytes);
+                    return rewrite(name, bytes);
                 } catch (RuntimeException e) {
                     System.out.println("[shm] could not rewrite " + name + ": " + e);
                     return null;
                 }
             }
         });
-    }
-
-    /**
-     * Each {@code getRaw()} on a storage becomes {@code RustBitStorage.raw(storage)}, and the method flushes before it
-     * returns or throws, so a method that writes into the array (PalettedContainer.read, Heightmap.setRawData) writes
-     * into Rust's memory.
-     */
-    static boolean lendRaw(ClassNode node, MethodNode m) {
-        boolean lent = false;
-        for (AbstractInsnNode insn : m.instructions) {
-            if (insn instanceof MethodInsnNode c && c.name.equals("getRaw") && c.desc.equals("()[J")
-                    && (c.owner.equals(STORAGE) || c.owner.equals("net/minecraft/util/BitStorage"))) {
-                m.instructions.set(c, new MethodInsnNode(Opcodes.INVOKESTATIC, RUST, "raw",
-                        "(Lnet/minecraft/util/BitStorage;)[J", false));
-                lent = true;
-            }
-        }
-        if (!lent) {
-            return false;
-        }
-        for (AbstractInsnNode insn : m.instructions.toArray()) {
-            int op = insn.getOpcode();
-            if (op >= Opcodes.IRETURN && op <= Opcodes.RETURN || op == Opcodes.ATHROW) {
-                m.instructions.insertBefore(insn, new MethodInsnNode(Opcodes.INVOKESTATIC, RUST, "flush", "()V", false));
-            }
-        }
-        synchronized (SITES) {
-            SITES.add("raw:" + node.name + "." + m.name);
-        }
-        return true;
     }
 
     /**
@@ -175,97 +129,6 @@ public final class Agent {
     }
 
     /**
-     * Whether a class is defined with the bytes its jar holds: no loader, mixin or agent before this one changed
-     * it. P4 runs light in Rust only when every light class is vanilla's own ({@link RustLight#rustRuns}).
-     */
-    static boolean sameAsJar(ProtectionDomain domain, String name, byte[] bytes) {
-        try {
-            java.net.URL where = domain == null || domain.getCodeSource() == null ? null
-                    : domain.getCodeSource().getLocation();
-            if (where == null) {
-                return false;
-            }
-            try (java.util.jar.JarFile jar = new java.util.jar.JarFile(new java.io.File(where.toURI()))) {
-                java.util.jar.JarEntry entry = jar.getJarEntry(name + ".class");
-                return entry != null && java.util.Arrays.equals(jar.getInputStream(entry).readAllBytes(), bytes);
-            }
-        } catch (Exception e) {
-            return false;
-        }
-    }
-
-    /**
-     * P4: in {@code LightEngine.runLightUpdates}, {@code propagateDecreases()} becomes {@code RustLight.propagate(this)}
-     * and {@code propagateIncreases()} {@code RustLight.zero(this)}.
-     */
-    static boolean hookEngine(ClassNode node) {
-        boolean changed = false;
-        for (MethodNode m : node.methods) {
-            if (!m.name.equals("runLightUpdates") || !m.desc.equals("()I")) {
-                continue;
-            }
-            for (AbstractInsnNode insn : m.instructions.toArray()) {
-                if (insn instanceof MethodInsnNode c && c.owner.equals(ENGINE) && c.desc.equals("()I")
-                        && (c.name.equals("propagateDecreases") || c.name.equals("propagateIncreases"))) {
-                    m.instructions.set(c, new MethodInsnNode(Opcodes.INVOKESTATIC, "dev/horizonlab/shm/RustLight",
-                            c.name.equals("propagateDecreases") ? "propagate" : "zero", "(L" + ENGINE + ";)I", false));
-                    changed = true;
-                }
-            }
-        }
-        return changed;
-    }
-
-    /**
-     * P4: {@code LevelChunkSection} gets its light-class snapshot's address and version ({@link RustLight#snapshot});
-     * with {@code hz.light=accel}, {@code setBlockState} and {@code read} tell {@link RustLight} what changed before
-     * they return.
-     */
-    static boolean hookSection(ClassNode node) {
-        node.fields.add(new org.objectweb.asm.tree.FieldNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_VOLATILE, SECTION_LIGHT,
-                "J", null, null));
-        node.fields.add(new org.objectweb.asm.tree.FieldNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_VOLATILE,
-                SECTION_VERSION, "I", null, null));
-        if (!"accel".equals(LIGHT)) {
-            return true;
-        }
-        String state = "Lnet/minecraft/world/level/block/state/BlockState;";
-        for (MethodNode m : node.methods) {
-            boolean set = m.name.equals("setBlockState") && m.desc.equals("(III" + state + "Z)" + state);
-            boolean read = m.name.equals("read") && m.desc.equals("(Lnet/minecraft/network/FriendlyByteBuf;)V");
-            if (!set && !read) {
-                continue;
-            }
-            for (AbstractInsnNode insn : m.instructions.toArray()) {
-                if (insn.getOpcode() != Opcodes.ARETURN && insn.getOpcode() != Opcodes.RETURN) {
-                    continue;
-                }
-                InsnList call = new InsnList();
-                call.add(new VarInsnNode(Opcodes.ALOAD, 0));
-                if (set) {
-                    call.add(new VarInsnNode(Opcodes.ILOAD, 1));
-                    call.add(new VarInsnNode(Opcodes.ILOAD, 2));
-                    call.add(new VarInsnNode(Opcodes.ILOAD, 3));
-                    call.add(new VarInsnNode(Opcodes.ALOAD, 4));
-                    call.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "dev/horizonlab/shm/RustLight", "blockSet",
-                            "(L" + SECTION + ";III" + state + ")V", false));
-                } else {
-                    call.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "dev/horizonlab/shm/RustLight", "sectionRead",
-                            "(L" + SECTION + ";)V", false));
-                }
-                m.instructions.insertBefore(insn, call);
-            }
-        }
-        return true;
-    }
-
-    /** P4: {@code BlockStateBase} gets the field its light class is kept in ({@link RustLight#classOf}). */
-    static boolean hookState(ClassNode node) {
-        node.fields.add(new org.objectweb.asm.tree.FieldNode(Opcodes.ACC_PUBLIC, STATE_CLASS, "I", null, null));
-        return true;
-    }
-
-    /**
      * P4's relight test ({@code hz.relight}): every chunk loaded from the save comes in unlit, so the game lights it
      * from scratch as it lights a new one. In {@code SerializableChunkData.parse}, {@code getBooleanOr("isLightOn",
      * ...)} gives false, and each section's {@code getByteArray("BlockLight")} and {@code ("SkyLight")} nothing.
@@ -302,88 +165,19 @@ public final class Agent {
         return changed;
     }
 
-    /** A method reference to a vanilla constructor ({@code DataLayer::new}), as a reference to its factory. */
-    static Handle factoryHandle(Handle h) {
-        String factory = FACTORIES.get(h.getOwner());
-        if (h.getTag() != Opcodes.H_NEWINVOKESPECIAL || factory == null) {
-            return null;
-        }
-        String desc = Type.getMethodDescriptor(Type.getObjectType(h.getOwner()), Type.getArgumentTypes(h.getDesc()));
-        return new Handle(Opcodes.H_INVOKESTATIC, factory, "create", desc, false);
-    }
-
-    static void site(String name) {
-        REWRITTEN.incrementAndGet();
-        synchronized (SITES) {
-            SITES.add(name);
-        }
-    }
-
-    /**
-     * Each NEW/DUP ... INVOKESPECIAL <init> of a vanilla class in {@link #FACTORIES} becomes the arguments, then
-     * INVOKESTATIC create; each method reference to such a constructor becomes a reference to create.
-     */
-    static byte[] rewrite(byte[] bytes) {
-        ClassReader reader = new ClassReader(bytes);
-        String text = new String(bytes, java.nio.charset.StandardCharsets.ISO_8859_1);
-        boolean testServer = reader.getClassName().equals(TEST_SERVER) && System.getProperty("hz.world") != null;
-        String className = reader.getClassName();
-        boolean light = LIGHT != null && STORE
-                && (className.equals(ENGINE) || className.equals(SECTION) || className.equals(STATE_BASE));
-        boolean relight = Boolean.getBoolean("hz.relight")
-                && className.equals("net/minecraft/world/level/chunk/storage/SerializableChunkData");
-        if (!text.contains(STORAGE) && !text.contains(LAYER) && !text.contains("getRaw") && !testServer
-                && !reader.getClassName().equals(TEST_MAIN) && !light && !relight) {
+    static byte[] rewrite(String name, byte[] bytes) {
+        boolean testServer = name.equals(TEST_SERVER) && System.getProperty("hz.world") != null;
+        boolean keep = name.equals(TEST_MAIN) && Boolean.getBoolean("hz.keep");
+        boolean relight = name.equals(CHUNK_DATA) && Boolean.getBoolean("hz.relight");
+        if (!testServer && !keep && !relight && !Rewrites.wanted(name, bytes)) {
             return null;
         }
         ClassNode node = new ClassNode();
-        reader.accept(node, 0);
+        new ClassReader(bytes).accept(node, 0);
         boolean changed = testServer && hookWorld(node);
-        if (relight) {
-            changed |= hookRelight(node);
-        }
-        if (light) {
-            changed |= switch (className) {
-                case ENGINE -> hookEngine(node);
-                case SECTION -> hookSection(node);
-                default -> hookState(node);
-            };
-        }
-        if (reader.getClassName().equals(TEST_MAIN) && Boolean.getBoolean("hz.keep")) {
-            changed |= keepWorld(node);
-        }
-        for (MethodNode m : STORE ? node.methods : List.<MethodNode>of()) {
-            changed |= lendRaw(node, m);
-            Deque<AbstractInsnNode> open = new ArrayDeque<>();
-            for (AbstractInsnNode insn = m.instructions.getFirst(); insn != null; ) {
-                AbstractInsnNode next = insn.getNext();
-                if (insn instanceof TypeInsnNode t && t.getOpcode() == Opcodes.NEW && FACTORIES.containsKey(t.desc)
-                        && next != null && next.getOpcode() == Opcodes.DUP) {
-                    open.push(t);
-                } else if (insn instanceof MethodInsnNode c && c.getOpcode() == Opcodes.INVOKESPECIAL
-                        && FACTORIES.containsKey(c.owner) && c.name.equals("<init>") && !open.isEmpty()
-                        && ((TypeInsnNode) open.peek()).desc.equals(c.owner)) {
-                    AbstractInsnNode created = open.pop();
-                    m.instructions.remove(created.getNext());
-                    m.instructions.remove(created);
-                    Type[] args = Type.getArgumentTypes(c.desc);
-                    String desc = Type.getMethodDescriptor(Type.getObjectType(c.owner), args);
-                    m.instructions.set(c, new MethodInsnNode(Opcodes.INVOKESTATIC, FACTORIES.get(c.owner), "create",
-                            desc, false));
-                    changed = true;
-                    site(node.name + "." + m.name);
-                } else if (insn instanceof InvokeDynamicInsnNode indy) {
-                    for (int i = 0; i < indy.bsmArgs.length; i++) {
-                        if (indy.bsmArgs[i] instanceof Handle h && factoryHandle(h) != null) {
-                            indy.bsmArgs[i] = factoryHandle(h);
-                            changed = true;
-                            site("ref:" + node.name + "." + m.name);
-                        }
-                    }
-                }
-                insn = next;
-            }
-        }
+        changed |= keep && keepWorld(node);
+        changed |= relight && hookRelight(node);
+        changed |= Rewrites.apply(node);
         if (!changed) {
             return null;
         }

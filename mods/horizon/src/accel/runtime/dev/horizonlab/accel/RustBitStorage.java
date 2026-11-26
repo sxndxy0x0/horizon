@@ -1,4 +1,4 @@
-package dev.horizonlab.shm;
+package dev.horizonlab.accel;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -243,11 +243,11 @@ public final class RustBitStorage extends SimpleBitStorage {
     }
 
     // For the probe: the memory Rust owns.
-    MemorySegment words() {
+    public MemorySegment words() {
         return words;
     }
 
-    int wordCount() {
+    public int wordCount() {
         return count;
     }
 }
