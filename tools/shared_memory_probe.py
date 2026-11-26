@@ -98,6 +98,9 @@ def main() -> int:
                     help="P4 instead: the same saved world edited and lit by vanilla's light engine (twice) and by "
                          "Rust's propagation (-Dhz.light=accel), compared chunk by chunk, with the time each spent")
     ap.add_argument("--reuse", action="store_true", help="with --light: keep the generated world of a run before")
+    ap.add_argument("--speed", type=int, default=0,
+                    help="with --light: only time the edits' light, vanilla's engine and Rust's taking turns N times "
+                         "(the machine's speed drifts over minutes)")
     ap.add_argument("--rust-only", action="store_true",
                     help="with --light: run only Rust's propagation, against the vanilla-engine runs of a run before")
     args = ap.parse_args()
@@ -301,36 +304,61 @@ def light(args, java: str, lib: Path, jar: Path, cp: list[Path], out: Path) -> t
     propagation, both on Rust's memory (P2), compared chunk by chunk; and the time each spent propagating."""
     run = world(args, java, lib, jar, cp, out)
     report = ["## Light: vanilla's engine against Rust's propagation", ""]
+    if args.speed:
+        report += ["| round | vanilla ms | Rust ms | entries (vanilla / Rust) |", "|---|---:|---:|---|"]
+        ok = True
+        for i in range(args.speed):
+            got = {}
+            for kind, prop in (("java", "time"), ("rust", "accel")):
+                lines = run(f"speed-{kind}-{i}", "rust", 40_000, "generated", (f"-Dhz.light={prop}",))
+                if isinstance(lines, str):
+                    return False, report + [f"- {lines}"]
+                line = next(l for l in lines if l.startswith("light	"))
+                fields = dict(f.rsplit(" ", 1) for f in line.split("	")[2:] if " " in f and f.rsplit(" ", 1)[1].isdigit())
+                got[kind] = fields
+                ok &= kind == "java" or fields.get("java runs") == "0"
+            report.append(f"| {i + 1} | {got['java']['ms']} | {got['rust']['ms']} | "
+                          f"{got['java']['entries']} / {got['rust']['entries']} |")
+        return ok, report
     plan = [("light-java", "rust", 40_000, "generated", ("-Dhz.light=time",)),
             ("light-java-again", "rust", 40_000, "generated", ("-Dhz.light=time",)),
-            ("light-rust", "rust", 40_000, "generated", ("-Dhz.light=accel",))]
+            ("light-rust", "rust", 40_000, "generated", ("-Dhz.light=accel",)),
+            # The save loaded unlit (light dropped, isLightOn false): every chunk lit from scratch, as a new one.
+            ("relight-java", "rust", 0, "generated", ("-Dhz.light=time", "-Dhz.relight=true")),
+            ("relight-java-again", "rust", 0, "generated", ("-Dhz.light=time", "-Dhz.relight=true")),
+            ("relight-rust", "rust", 0, "generated", ("-Dhz.light=accel", "-Dhz.relight=true"))]
     if not (args.reuse and (out / "world-generated" / "universe").exists()):
         plan.insert(0, ("generated", "vanilla", 0, None, ()))
     runs = {}
     for slug, mode, edits, start_from, extra in plan:
         before = out / f"world-{slug}.tsv"
-        if args.rust_only and slug != "light-rust" and before.exists():
+        if args.rust_only and not slug.endswith("-rust") and before.exists():
             runs[slug] = read(before)
             continue
         got = run(slug, mode, edits, start_from, extra)
         if isinstance(got, str):
             return False, report + [f"- {got}"]
         runs[slug] = got
-    a, b, c = (chunk_fields(runs[k]) for k in ("light-java", "light-rust", "light-java-again"))
-    ok = len(a) == len(b) > 0 and set(a) == set(b)
-    report.append(f"- chunks: {len(a)} / {len(b)}")
-    for field in FIELDS:
-        differ = sum(1 for k in a if a[k].get(field) != b.get(k, {}).get(field))
-        control = sum(1 for k in a if a[k].get(field) != c.get(k, {}).get(field))
-        report.append(f"- {field}: {differ} chunks differ (vanilla against itself: {control})")
-        ok &= differ == 0 or (field == "saved" and differ <= control)
-    report.append("")
-    for slug in ("light-java", "light-java-again", "light-rust"):
-        for line in runs[slug]:
-            if line.startswith("light\t"):
-                report.append(f"- {slug}: {line.replace(chr(9), ', ')}")
-                if slug == "light-rust":
-                    ok &= "java runs 0" in line
+    ok = True
+    for title, (java, rust, again) in (
+            ("The probe's edits, lit", ("light-java", "light-rust", "light-java-again")),
+            ("The whole save lit from scratch (loaded unlit)", ("relight-java", "relight-rust", "relight-java-again"))):
+        a, b, c = (chunk_fields(runs[k]) for k in (java, rust, again))
+        report += [f"### {title}", "", f"- chunks: {len(a)} / {len(b)}"]
+        ok &= len(a) == len(b) > 0 and set(a) == set(b)
+        for field in FIELDS:
+            differ = sum(1 for k in a if a[k].get(field) != b.get(k, {}).get(field))
+            control = sum(1 for k in a if a[k].get(field) != c.get(k, {}).get(field))
+            report.append(f"- {field}: {differ} chunks differ (vanilla against itself: {control})")
+            ok &= differ == 0 or (field == "saved" and differ <= control)
+        report.append("")
+        for slug in (java, again, rust):
+            for line in runs[slug]:
+                if line.startswith("light\t"):
+                    report.append(f"- {slug}: {line.replace(chr(9), ', ')}")
+                    if slug == rust:
+                        ok &= "java runs 0" in line
+        report.append("")
     return ok, report
 
 

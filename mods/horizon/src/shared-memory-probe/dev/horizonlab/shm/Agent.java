@@ -265,6 +265,43 @@ public final class Agent {
         return true;
     }
 
+    /**
+     * P4's relight test ({@code hz.relight}): every chunk loaded from the save comes in unlit, so the game lights it
+     * from scratch as it lights a new one. In {@code SerializableChunkData.parse}, {@code getBooleanOr("isLightOn",
+     * ...)} gives false, and each section's {@code getByteArray("BlockLight")} and {@code ("SkyLight")} nothing.
+     */
+    static boolean hookRelight(ClassNode node) {
+        boolean changed = false;
+        for (MethodNode m : node.methods) {
+            for (AbstractInsnNode insn : m.instructions.toArray()) {
+                if (!(insn instanceof org.objectweb.asm.tree.LdcInsnNode ldc) || !(ldc.cst instanceof String key)) {
+                    continue;
+                }
+                AbstractInsnNode call = insn.getNext();
+                while (call != null && !(call instanceof MethodInsnNode)) {
+                    call = call.getNext();
+                }
+                if (!(call instanceof MethodInsnNode c)) {
+                    continue;
+                }
+                InsnList replace = new InsnList();
+                if (key.equals("isLightOn") && c.name.equals("getBooleanOr")) {
+                    replace.add(new InsnNode(Opcodes.POP));
+                    replace.add(new InsnNode(Opcodes.ICONST_0));
+                } else if ((key.equals("BlockLight") || key.equals("SkyLight")) && c.name.equals("getByteArray")) {
+                    replace.add(new InsnNode(Opcodes.POP));
+                    replace.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "java/util/Optional", "empty",
+                            "()Ljava/util/Optional;", false));
+                } else {
+                    continue;
+                }
+                m.instructions.insert(c, replace);
+                changed = true;
+            }
+        }
+        return changed;
+    }
+
     /** A method reference to a vanilla constructor ({@code DataLayer::new}), as a reference to its factory. */
     static Handle factoryHandle(Handle h) {
         String factory = FACTORIES.get(h.getOwner());
@@ -293,13 +330,18 @@ public final class Agent {
         String className = reader.getClassName();
         boolean light = LIGHT != null && STORE
                 && (className.equals(ENGINE) || className.equals(SECTION) || className.equals(STATE_BASE));
+        boolean relight = Boolean.getBoolean("hz.relight")
+                && className.equals("net/minecraft/world/level/chunk/storage/SerializableChunkData");
         if (!text.contains(STORAGE) && !text.contains(LAYER) && !text.contains("getRaw") && !testServer
-                && !reader.getClassName().equals(TEST_MAIN) && !light) {
+                && !reader.getClassName().equals(TEST_MAIN) && !light && !relight) {
             return null;
         }
         ClassNode node = new ClassNode();
         reader.accept(node, 0);
         boolean changed = testServer && hookWorld(node);
+        if (relight) {
+            changed |= hookRelight(node);
+        }
         if (light) {
             changed |= switch (className) {
                 case ENGINE -> hookEngine(node);

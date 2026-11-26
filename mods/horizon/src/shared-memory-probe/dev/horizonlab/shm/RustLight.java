@@ -173,7 +173,10 @@ public final class RustLight {
         return LINKER.upcallStub(LOOKUP.findStatic(RustLight.class, name, t), d, Arena.global());
     }
 
-    /** Whether Rust may run the propagation: accelerating, and every light class vanilla's own. */
+    /**
+     * Whether Rust may run the propagation: accelerating, every guarded class vanilla's own, and every block state's
+     * light class fitting the snapshots' byte ({@link #allClassesFit}).
+     */
     static boolean rustRuns() {
         if (!ACCEL) {
             return false;
@@ -183,7 +186,29 @@ public final class RustLight {
                 return false;
             }
         }
-        return true;
+        return allClassesFit();
+    }
+
+    private static volatile Boolean fit;
+
+    /**
+     * Names the light class of every block state the game has (its states are all registered by the time light
+     * runs), once: no class is named after this, so a snapshot's byte a block can hold 256 classes. A game with
+     * more keeps Java's propagation.
+     */
+    static boolean allClassesFit() {
+        Boolean f = fit;
+        if (f == null) {
+            globalClasses();
+            synchronized (CLASS_IDS) {
+                f = CLASS_IDS.size() <= 256;
+            }
+            if (!f) {
+                System.out.println("[shm] " + CLASS_IDS.size() + " light classes: more than a byte holds, light stays Java");
+            }
+            fit = f;
+        }
+        return f;
     }
 
     // -- The engine ----------------------------------------------------------------------------------------------
@@ -225,7 +250,12 @@ public final class RustLight {
         return 0;
     }
 
+    private static final java.util.Set<String> ANNOUNCED = ConcurrentHashMap.newKeySet();
+
     private static int rust(LightEngine<?, ?> engine) throws Throwable {
+        if (ANNOUNCED.add(Thread.currentThread().getName())) {
+            System.out.println("[shm] light: Rust propagates on " + Thread.currentThread().getName());
+        }
         LongArrayFIFOQueue decrease = (LongArrayFIFOQueue) DECREASE.get(engine);
         LongArrayFIFOQueue increase = (LongArrayFIFOQueue) INCREASE.get(engine);
         if (decrease.isEmpty() && increase.isEmpty()) {
@@ -363,12 +393,12 @@ public final class RustLight {
     // -- Block snapshots -----------------------------------------------------------------------------------------
 
     private static final int CELLS = 4096;
-    private static final int WORDS = CELLS * 2 / 8;
+    private static final int WORDS = CELLS / 8;
     /** Snapshots of chunks that are not {@code ChunkAccess} (none in vanilla), kept for the life of the game. */
     private static final List<MemorySegment> COPIES = new ArrayList<>();
 
     /**
-     * The section's light classes, a {@code u16} per block, made on first use and then kept up to date by
+     * The section's light classes, a byte per block, made on first use and then kept up to date by
      * {@link #blockSet}. The section's version guards the making against a block set at the same time: it is
      * filled again until no set came in while it was being filled, and a set after it is published writes the
      * snapshot itself.
@@ -416,8 +446,8 @@ public final class RustLight {
             int[] at = {0};
             // The server thread may add to the palette while this reads (the version loop in snapshot() fills
             // again then): an entry past the size read above is looked up as it comes.
-            storage.getAll(id -> Rust.ALL.set(ValueLayout.JAVA_SHORT_UNALIGNED, address + 2L * at[0]++,
-                    id < map.length ? map[id] : (short) classOf(palette.valueFor(id))));
+            storage.getAll(id -> Rust.ALL.set(ValueLayout.JAVA_BYTE, address + at[0]++,
+                    (byte) (id < map.length ? map[id] : classOf(palette.valueFor(id)))));
         } catch (Throwable t) {
             throw new IllegalStateException(t);
         }
@@ -440,14 +470,13 @@ public final class RustLight {
     }
 
     private static long copy(LightChunk chunk, int sx, int sy, int sz) {
-        MemorySegment cells = Arena.global().allocate(2L * CELLS, 8);
+        MemorySegment cells = Arena.global().allocate(CELLS, 8);
         BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
         for (int y = 0; y < 16; y++) {
             for (int z = 0; z < 16; z++) {
                 for (int x = 0; x < 16; x++) {
                     pos.set(sx * 16 + x, sy * 16 + y, sz * 16 + z);
-                    cells.set(ValueLayout.JAVA_SHORT_UNALIGNED, 2L * (y << 8 | z << 4 | x),
-                            (short) classOf(chunk.getBlockState(pos)));
+                    cells.set(ValueLayout.JAVA_BYTE, y << 8 | z << 4 | x, (byte) classOf(chunk.getBlockState(pos)));
                 }
             }
         }
@@ -462,7 +491,7 @@ public final class RustLight {
         SECTION_VERSION.getAndAdd(s, 1);
         long at = (long) SECTION_LIGHT.getVolatile(s);
         if (at != 0) {
-            Rust.ALL.set(ValueLayout.JAVA_SHORT_UNALIGNED, at + 2L * (y << 8 | z << 4 | x), (short) classOf(state));
+            Rust.ALL.set(ValueLayout.JAVA_BYTE, at + (y << 8 | z << 4 | x), (byte) classOf(state));
         }
     }
 

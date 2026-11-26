@@ -16,6 +16,9 @@ final class LightNames {
         "net/minecraft/world/level/lighting/SkyLightSectionStorage",
         "net/minecraft/world/level/lighting/BlockLightSectionStorage",
         "net/minecraft/world/level/lighting/DataLayerStorageMap",
+        // The block snapshots (RustLight.snapshot) read these directly, past LightChunk.getBlockState.
+        "net/minecraft/world/level/chunk/LevelChunkSection",
+        "net/minecraft/world/level/chunk/PalettedContainer",
     };
     static final Map<String, Boolean> VANILLA_BYTES = new ConcurrentHashMap<>();
 

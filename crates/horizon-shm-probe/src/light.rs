@@ -226,7 +226,8 @@ pub struct Callbacks {
     /// stored there), the address of its 2048 bytes, or `-(default + 1)` for a layer that holds only its default
     /// level. With `write` 1: the layer to write, after `setStoredLevel`'s copy-on-write (always bytes).
     pub layer: extern "C" fn(section: i64, write: i32) -> i64,
-    /// The light classes of the section's 4096 blocks (`y << 8 | z << 4 | x`, a `u16` each), or 0 for a section of
+    /// The light classes of the section's 4096 blocks (`y << 8 | z << 4 | x`, a byte each: Java runs
+    /// Rust only when every class fits one), or 0 for a section of
     /// air (or past the chunk's height), or -1 when there is no chunk (`LightEngine.getState`: bedrock).
     pub blocks: extern "C" fn(section: i64) -> i64,
     /// `LayerLightSectionStorage.lightOnInSection`.
@@ -246,7 +247,7 @@ enum Layer {
 enum Blocks {
     Air,
     NoChunk,
-    Classes(*const u16),
+    Classes(*const u8),
 }
 
 struct Section {
@@ -509,7 +510,7 @@ impl<'a> Run<'a> {
         let blocks = *s.blocks.get_or_insert_with(|| match (calls.blocks)(node) {
             0 => Blocks::Air,
             -1 => Blocks::NoChunk,
-            p => Blocks::Classes(p as *const u16),
+            p => Blocks::Classes(p as *const u8),
         });
         match blocks {
             Blocks::Air => self.air,

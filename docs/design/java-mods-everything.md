@@ -108,7 +108,7 @@
 1. ✅ **P1 Agent + diff ของ bytecode:** บูต Fabric 26.3 และ NeoForge 26.3 จริงพร้อมม็อดตัวอย่างใน JVM ธรรมดา แล้วให้ agent ออกรายงานว่าม็อดแตะ method ไหน ยังไม่ต้องใช้ Horizon เครื่องนี้มี Fabric 26.3 อยู่แล้ว
 2. ✅ **P2 หน่วยความจำร่วม:** บล็อก แสง และ heightmap ของเกม Java ตัวจริงอยู่บนหน่วยความจำของ Rust โลกจริงที่แก้แล้วให้แสงแล้วเซฟออกมาตรงกับ vanilla ทุก chunk และ `LevelAccess` ของ Horizon อ่านเขียนโลกที่กำลังรันอยู่ได้ตรง
 3. ✅ **P3 วาดภาพ:** Java client จริงวาดผ่าน backend wgpu ของ Horizon ทั้งหน้า title (ตรง OpenGL ทุก pixel) และในโลก (ต่างจาก OpenGL น้อยกว่าที่ Vulkan ของ Mojang ต่าง) เร็วกว่า Vulkan ของ Mojang เล็กน้อย และถอยไปใช้ backend ของเกมเองเมื่อ wgpu ใช้ไม่ได้
-4. ✅ **P4 accelerator ตัวแรก:** การกระจายแสงของเกมจริงรันใน Rust บนข้อมูลแสงของเกมเอง ผลตรง vanilla ทุก chunk และเร็วขึ้นราว 1.4 เท่า (5.8–6.9 s → 4.2–4.7 s) เปิดเฉพาะเมื่อคลาสระบบไฟทุกตัวเป็น bytecode ของ vanilla
+4. ✅ **P4 accelerator ตัวแรก:** การกระจายแสงของเกมจริงรันใน Rust บนข้อมูลแสงของเกมเอง ผลตรง vanilla ทุก chunk ทั้งตอนแก้บล็อกและตอนให้แสงทั้งโลกใหม่ ฝั่ง client ภาพตรงด้วย และเร็วขึ้นราว 1.6 เท่า เปิดเฉพาะเมื่อคลาสระบบไฟทุกตัวเป็น bytecode ของ vanilla
 
 ## ผล P1 (2026-11-25)
 
@@ -434,7 +434,7 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
 
 ## ผล P4 (2026-11-26): ระบบไฟของเกมจริงกระจายแสงด้วย Rust
 
-ตัวทดลอง: `python tools/shared_memory_probe.py --light [--reuse] [--rust-only]`
+ตัวทดลอง: `python tools/shared_memory_probe.py --light [--reuse] [--rust-only] [--speed N]`
 
 - **ฝั่ง Rust:** `crates/horizon-shm-probe/src/light.rs`
   - port ของ `LightEngine.propagateDecreases`/`propagateIncreases` กับ `propagateDecrease`/`propagateIncrease` ของ `BlockLightEngine` และ `SkyLightEngine` (26.3) ทีละคำสั่ง ใช้คิวเดียวกันในลำดับเดียวกัน ค่าแสงทุกค่าที่เขียนจึงเป็นค่าที่ vanilla เขียน
@@ -445,40 +445,43 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
 - **สิ่งที่ Rust ถาม Java (upcall ผ่าน FFM) ครั้งเดียวต่อ section ต่อรอบ:**
   - layer ของ section: การเขียนครั้งแรกผ่าน copy-on-write ของ `setStoredLevel` ใน Java แผนที่ของเกมจึงถูกเสมอ
   - บล็อกของ section เป็น "class แสง" (ค่าที่ระบบไฟถามบล็อก: emission, dampening, รูปทรงที่บังแสง 6 ด้าน) เก็บเป็น snapshot ต่อ `LevelChunkSection`
+    - 1 byte ต่อบล็อก (4 KB ต่อ section) ก่อน Rust รันครั้งแรก Java ตั้ง class ให้ทุก block state ในเกม (vanilla มี 141 class) ถ้าเกิน 256 จะใช้ Java แทน
     - สร้างครั้งแรกจาก palette กับ storage ของ section (palette แปลงครั้งเดียว แล้วไล่ storage ตามลำดับ)
     - หลังจากนั้น `setBlockState` ของเกมเขียนตามทันที (Agent เติม hook) และ `read` ของ client เติมใหม่ทั้ง section
     - มี version กันกรณีเกมเขียนบล็อกระหว่างสร้าง snapshot
   - `lightOnInSection` และ `Shapes.faceShapeOccludes` ของคู่หน้า (จำไว้ทั้งเกม)
 - **class แสงมาจาก method ของ `BlockState` ใน Java:** บล็อกของม็อดที่ override ค่าเหล่านี้จึงได้ค่าของม็อดเอง
-- **แผนว่าปลอดภัยไหม:** Agent เทียบ bytes ของคลาสระบบไฟ 7 ตัวกับใน jar ตอนเกมโหลด ถ้าตัวไหนถูก loader หรือม็อดแก้ จะกลับไปใช้ Java ทั้งหมด (`java runs` ในรายงาน)
+- **แผนว่าปลอดภัยไหม:** Agent เทียบ bytes ของคลาสระบบไฟ 7 ตัว และ `LevelChunkSection` กับ `PalettedContainer` (ที่ snapshot อ่านตรง ๆ) กับใน jar ตอนเกมโหลด ถ้าตัวไหนถูก loader หรือม็อดแก้ จะกลับไปใช้ Java ทั้งหมด (`java runs` ในรายงาน)
 
-### ผล (โลก normal 144 chunk เดียวกับ P2, แก้บล็อก 40,000 จุด, รอแสงนิ่ง, เซฟ)
+### ผล (โลก normal 144 chunk เดียวกับ P2)
 
-- **ตรง vanilla ทุก chunk:** บล็อก, biome, แสงบล็อก, แสงท้องฟ้า, heightmap และ NBT ที่เซฟ ต่าง 0/144 (vanilla เทียบกับตัวเองก็ 0)
+- **แก้บล็อก 40,000 จุด รอแสงนิ่ง แล้วเซฟ:** บล็อก, biome, แสงบล็อก, แสงท้องฟ้า, heightmap และ NBT ที่เซฟ ต่าง 0/144 (vanilla เทียบกับตัวเองก็ 0)
   - ตรงทั้งกับรอบ vanilla ผ่าน hook (เรียก method เดิมของเกม) และกับรอบของ P2 ที่ไม่มี hook เลย
-- **Rust รันทุกรอบ:** ราว 1,300 รอบของ `runLightUpdates` ไม่มีรอบไหนกลับไปใช้ Java
-- **ความเร็ว (เวลารวมของการกระจายแสง ราว 13.4–13.9 ล้าน entry):**
+- **ให้แสงทั้งโลกใหม่ (เส้นทางเดียวกับตอนสร้าง chunk):** โหลดเซฟเดิมแบบไม่มีแสง (`-Dhz.relight=true`: ทิ้ง `BlockLight`/`SkyLight` และ `isLightOn` เป็น false) เกมจึงให้แสงทุก chunk ตั้งแต่ศูนย์ด้วย `propagateLightSources` ตามด้วยการกระจาย ผลต่าง 0/144 ทุกอย่างเช่นกัน
+- **ฝั่ง client:** เปิด client จริงเข้าโลกด้วย agent นี้ (`HZ_JVM_EXTRA` ของตัวทดลอง P3) ระบบไฟของ client บน Render thread และของ server ในตัวเกมรันด้วย Rust ทั้งคู่ ภาพต่างจาก vanilla 0.0005–0.026 ซึ่งเท่ากับที่ vanilla ต่างจากตัวเองระหว่างรอบ (0.026)
+- **Rust รันทุกรอบ:** ไม่มีรอบไหนกลับไปใช้ Java
+- **ความเร็ว (`--speed 3`: vanilla กับ Rust สลับกันรอบละตัว เพราะความเร็วของเครื่องเปลี่ยนไปมาเกือบเท่าตัวในวันเดียว; เวลารวมของการกระจายแสงจากการแก้ 40,000 จุด ราว 13.4–13.9 ล้าน entry):**
 
-| | เวลา |
-|---|---:|
-| vanilla (Java, 4 รอบ) | 5.8–6.9 s |
-| **Rust (3 รอบ)** | **4.2–4.7 s** |
+| รอบ | vanilla | **Rust** |
+|---|---:|---:|
+| 1 | 9.07 s | **5.70 s** |
+| 2 | 8.79 s | **5.55 s** |
+| 3 | 8.60 s | **5.60 s** |
 
-  - ในนั้นเป็นการสร้าง snapshot ราว 0.3 s และการถาม layer ราว 0.16 s
-  - งานของ Rust เองราว 250 ns ต่อ entry ในโลกจริง และ 130 ns ใน benchmark ที่ข้อมูลอยู่ใน cache ทั้งหมด (`bench_block_light_flood`) ส่วนต่างคือการรอหน่วยความจำ: โลกนี้ใช้ 3,400 section
+  - ในเวลาของ Rust มีการสร้าง snapshot และการถาม layer ฝั่ง Java รวมอยู่ราว 0.5–0.9 s
+  - งานของ Rust เองในโลกจริงช้ากว่าใน benchmark ที่ข้อมูลอยู่ใน cache ทั้งหมด (`bench_block_light_flood`, 130 ns ต่อ entry) เพราะต้องรอหน่วยความจำ: โลกนี้ใช้ 3,400 section
 
 ### สิ่งที่เจอระหว่างทาง
 
 - **palette เพิ่มระหว่างสร้าง snapshot:** worldgen หรือ server thread ใส่บล็อกชนิดใหม่ขณะ thread แสงอ่าน storage จึงเจอ id ที่เกินขนาด palette ที่อ่านไว้ แก้โดยถาม palette เพิ่มตอนเจอ แล้วให้ version สั่งอ่านซ้ำ
 - **อ่าน environment ทุกครั้งแพง:** `std::env::var_os` ต่อการเรียกหนึ่งครั้งช้ากว่างานแสงทั้ง entry (เจอทั้งใน P3 และตอนทดลองนี้)
+- **มี `find` ของผมค้างอยู่เบื้องหลังกิน CPU ไปหลายชั่วโมง:** (คำสั่งหาตัว decompile ทั้งดิสก์ที่หยุด task แล้วแต่โปรเซสยังไม่ตาย) ทำให้ตัวเลขช่วงหนึ่งช้าลง เจอแล้วปิดแล้ว และตัวเลขข้างบนวัดแบบสลับกันอยู่แล้ว
 - **`HashMap` ปกติของ Rust (SipHash) ช้าเกินไปสำหรับการหา section ทุก neighbor:** ใช้ hash แบบคูณครั้งเดียว และหา section ครั้งเดียวต่อ entry neighbor ใน section เดียวกันไม่ต้องหาซ้ำ
 
 ### ที่ยังเหลือ
 
-- **`checkNode` และ `propagateLightSources` ยังเป็น Java:** สองอย่างนี้แค่ใส่งานลงคิว (`SkyLightEngine.propagateLightSources` เติมแสง 15 ทั้งคอลัมน์ตอนสร้าง chunk ด้วย) ย้ายมา Rust ได้ด้วยวิธีเดียวกัน
-- **ยังไม่ได้ทดสอบตอนสร้างโลกใหม่และฝั่ง client:** hook ทำงานกับทุก `LightEngine` รวมถึงของ client แต่ชุดทดสอบตอนนี้คือการแก้บล็อกบนเซิร์ฟเวอร์ ควรเพิ่มรอบที่ให้ vanilla คำนวณแสงของโลกที่สร้างด้วย Rust ใหม่ทั้งหมดแล้วเทียบ
-- **ม็อดที่แก้ `PalettedContainer` หรือ `LevelChunkSection`:** snapshot อ่าน palette และ storage ของเกมตรง ๆ แผนยังไม่ได้ตรวจสองคลาสนี้
-- **snapshot ใช้ 2 byte ต่อบล็อก (8 KB ต่อ section):** ใช้ 1 byte ได้ถ้า class แสงไม่เกิน 255 (โลกนี้มี 11) ซึ่งน่าจะลดการรอหน่วยความจำได้
+- **`checkNode` และ `propagateLightSources` ยังเป็น Java:** สองอย่างนี้แค่ใส่งานลงคิว (`SkyLightEngine.propagateLightSources` เติมแสง 15 ทั้งคอลัมน์ตอนสร้าง chunk ด้วย) จึงเป็นส่วนเล็กของเวลา ย้ายมา Rust ได้ด้วยวิธีเดียวกันถ้าวัดแล้วคุ้ม
+- **ยังไม่ได้ตรวจ `LevelChunk.getBlockState`:** snapshot อ่าน section ตรง ๆ ข้ามเมธอดนี้ ม็อดที่แก้เมธอดนี้ (หรือโลก debug ของ vanilla ที่มีบล็อกพิเศษ) จะเห็นค่าต่างจากที่ระบบไฟของ Java เห็น
 - **ทั้งหมดยังอยู่ในตัวทดลอง P2/P4:** ยังไม่ได้ย้ายเข้าตัวม็อดจริง
 
 ## เอาอะไรจาก forge/ari มาใช้
