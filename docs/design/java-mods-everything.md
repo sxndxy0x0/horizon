@@ -510,6 +510,10 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
 - **NeoForge ใช้ `TransformingClassLoader` ใน module layer:** การ define คลาส runtime เข้า loader นั้นใช้ได้เลยโดยไม่ต้องแก้ module
 - **ตรวจแผนระดับ method:** Fabric API แก้ `LevelChunkSection` (นับอากาศแบบของตัวเอง) และ Sodium เติม method ให้ `PalettedContainer` ถ้าตรวจทั้งคลาส แสงจะไม่เร่งในแพ็กส่วนใหญ่ ตอนนี้ตรวจเฉพาะ method ที่ snapshot พึ่ง (`LevelChunkSection.getBlockState(III)`, `hasOnlyAir()`, `PalettedContainer.get`, `LevelChunk`/`ProtoChunk.getBlockState`) เทียบคำสั่งกับใน jar
   - ส่วนโลก debug ของ vanilla (`getBlockState` สร้างบล็อกเอง) อ่านทีละ cell ผ่าน `getBlockState`
+- **Sodium อ่าน word ของ `SimpleBitStorage` เอง:** mixin ของ Sodium เติม `sodium$unpack` ที่อ่าน field `data` ตรงๆ ตอนคัดลอก section ไปทำ mesh ส่วน storage ของ Rust เก็บ word ไว้ในหน่วยความจำของ Rust (`data` ว่าง) Sodium จึงเห็นทุก section เป็นอากาศ เกมเล่นได้แต่ไม่มีพื้นให้เห็น (ผู้เล่นเจอเองในการเล่นจริงครั้งแรก การทดสอบเดิมดูแค่ marker)
+  - `RustBitStorage` ทำ `sodium$unpack` เองจาก word ของ Rust
+  - ตอน `SimpleBitStorage` ถูก define agent เทียบกับใน jar: ทุก method ต้องทำงานเหมือนเดิม และ method ที่ม็อดเติมต้องเป็นตัวที่ `RustBitStorage` ทำด้วย (`Rewrites.STORAGE_ADDITIONS`) ไม่งั้น storage เป็นของ Java และบอกใน log
+  - `tools/java_accel.py run --shot PNG` ถ่ายหน้าต่างเกมหลังเข้าโลก 15 วินาที ให้ดูภาพได้ด้วย
 
 ### ผล (`tools/java_accel.py run` บนโลกจากตัวทดลอง P2)
 

@@ -47,6 +47,44 @@ def library_name(crate: str) -> str:
     return f"lib{crate}.dylib" if sys.platform == "darwin" else f"lib{crate}.so"
 
 
+# The game's window by its process, captured with PrintWindow (which also reads OpenGL and DirectX windows).
+SHOT = r'''
+param([int]$Id, [string]$Out)
+Add-Type -ReferencedAssemblies System.Drawing -TypeDefinition @"
+using System; using System.Runtime.InteropServices; using System.Drawing;
+public static class Shot {
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint f);
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int L, T, R, B; }
+  public static void Save(IntPtr h, string path) {
+    SetProcessDPIAware(); RECT r; GetWindowRect(h, out r);
+    var bmp = new Bitmap(r.R - r.L, r.B - r.T);
+    using (var g = Graphics.FromImage(bmp)) { var dc = g.GetHdc(); PrintWindow(h, dc, 2); g.ReleaseHdc(dc); }
+    bmp.Save(path, System.Drawing.Imaging.ImageFormat.Png);
+  }
+}
+"@
+$h = (Get-Process -Id $Id).MainWindowHandle
+if ($h -eq [IntPtr]::Zero) { "no window"; exit 1 }
+[Shot]::Save($h, $Out); "saved"
+'''
+
+
+def capture(pid: int, out: Path) -> str:
+    """Saves the window of the game process `pid` to `out` (Windows PowerShell 5.1, which has System.Drawing)."""
+    if os.name != "nt":
+        return "only on Windows"
+    script = out.with_suffix(".ps1")
+    script.write_text(SHOT, encoding="utf-8")
+    try:
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script),
+                            "-Id", str(pid), "-Out", str(out)], capture_output=True, text=True, timeout=60)
+        return f"{out}" if r.returncode == 0 else f"failed: {(r.stdout + r.stderr).strip()[-200:]}"
+    finally:
+        script.unlink(missing_ok=True)
+
+
 def build(minecraft: Path, version: str, java_home: Path | None, out: Path) -> Path:
     versions, libraries = minecraft / "versions", minecraft / "libraries"
     libs, _, _ = loader_probe.classpath(versions / version / f"{version}.json", versions, libraries)
@@ -179,8 +217,14 @@ def run(args) -> int:
             # With light the game kept (a mod changed a class it guards), Rust's light markers never come.
             need = [m for m in want if not ("fallback" in seen and m.startswith("light"))]
             return all(m in seen for m in need)
+        ready = None
         while proc.poll() is None and time.time() - start < args.timeout:
-            if done() and time.time() - start > args.settle:
+            if done() and ready is None:
+                ready = time.time()
+            if args.shot and ready is not None and time.time() - ready > 15:
+                print(f"- screenshot: {capture(proc.pid, args.shot.resolve())}")
+                args.shot = None
+            if done() and time.time() - start > args.settle and not args.shot:
                 break
             time.sleep(1)
         exited = proc.poll()
@@ -233,6 +277,7 @@ def main() -> int:
                    help="the player's launcher folder, for libraries and assets a --minecraft folder lacks (read only)")
     r.add_argument("--mods", type=Path, nargs="*", default=[], help="mod jars to play with (copied)")
     r.add_argument("--timeout", type=int, default=600, help="seconds to wait for the markers")
+    r.add_argument("--shot", type=Path, help="a PNG of the game's window, 15 seconds into the world (Windows)")
     r.add_argument("--settle", type=int, default=20, help="seconds to keep playing at least")
     args = ap.parse_args()
     if args.what == "build":

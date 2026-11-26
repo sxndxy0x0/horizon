@@ -68,6 +68,9 @@ public final class Rewrites {
 
     /** Records, for a guarded light class ({@link LightNames}), whether it is defined with its jar's own bytes. */
     public static void guard(ClassLoader loader, ProtectionDomain domain, String name, byte[] bytes) {
+        if (memory() && name.equals(STORAGE)) {
+            guardStorage(loader, domain, bytes);
+        }
         if (light() == null) {
             return;
         }
@@ -81,6 +84,49 @@ public final class Rewrites {
                 LightNames.VANILLA_BYTES.put(g, jar != null && code(bytes, method).equals(code(jar, method)));
             }
         }
+    }
+
+    /**
+     * What mods add to {@code SimpleBitStorage} that {@code RustBitStorage} does as well (name and descriptor):
+     * Sodium's copy of a section for its meshes.
+     */
+    static final java.util.Set<String> STORAGE_ADDITIONS = java.util.Set.of(
+            "sodium$unpack([Ljava/lang/Object;Lnet/minecraft/world/level/chunk/Palette;)V");
+
+    /**
+     * Records whether block storage may go to Rust: every method of the jar's {@code SimpleBitStorage} runs as it
+     * does there, and whatever a mod added is in {@link #STORAGE_ADDITIONS}. Else the game's storage stays its own.
+     */
+    static void guardStorage(ClassLoader loader, ProtectionDomain domain, byte[] bytes) {
+        byte[] jar = jarBytes(loader, domain, STORAGE);
+        List<String> changed = new ArrayList<>();
+        if (jar == null) {
+            changed.add("(no jar to compare with)");
+        } else {
+            java.util.Set<String> original = new java.util.HashSet<>();
+            for (MethodNode m : node(jar).methods) {
+                original.add(m.name + m.desc);
+                if (!code(bytes, m.name + m.desc).equals(code(jar, m.name + m.desc))) {
+                    changed.add(m.name + m.desc);
+                }
+            }
+            for (MethodNode m : node(bytes).methods) {
+                if (!original.contains(m.name + m.desc) && !STORAGE_ADDITIONS.contains(m.name + m.desc)) {
+                    changed.add(m.name + m.desc);
+                }
+            }
+        }
+        LightNames.VANILLA_BYTES.put(STORAGE, changed.isEmpty());
+        if (!changed.isEmpty()) {
+            System.out.println("[horizon-accel] block storage stays Java: SimpleBitStorage changed by a mod: " + changed);
+        }
+    }
+
+    static ClassNode node(byte[] bytes) {
+        ClassNode node = new ClassNode();
+        new org.objectweb.asm.ClassReader(bytes).accept(node, org.objectweb.asm.ClassReader.SKIP_DEBUG
+                | org.objectweb.asm.ClassReader.SKIP_FRAMES);
+        return node;
     }
 
     /**

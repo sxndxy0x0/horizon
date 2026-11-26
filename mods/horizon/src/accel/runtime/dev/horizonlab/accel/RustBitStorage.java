@@ -37,16 +37,32 @@ public final class RustBitStorage extends SimpleBitStorage {
     /** ceil(2^32 / valuesPerLong): index / valuesPerLong as a multiply, as vanilla divides (exact below 2^26). */
     private final long divide;
 
+    /**
+     * Whether storages go to Rust: not when a mod changed {@code SimpleBitStorage} in a way this class does not
+     * also do (the agent's verdict, made as the parent class was defined, before this one). A mod that reads or
+     * changes the parent's words would find none here.
+     */
+    static final boolean RUST = !Boolean.FALSE.equals(verdicts().get("net/minecraft/util/SimpleBitStorage"));
+
+    @SuppressWarnings("unchecked")
+    private static java.util.Map<String, Boolean> verdicts() {
+        Object m = System.getProperties().get("horizon.accel.vanilla");
+        return m instanceof java.util.Map<?, ?> map ? (java.util.Map<String, Boolean>) map : java.util.Map.of();
+    }
+
     // The game constructs storages through these, in place of SimpleBitStorage's constructors (Agent).
     public static SimpleBitStorage create(int bits, int size) {
-        return new RustBitStorage(bits, size, null);
+        return RUST ? new RustBitStorage(bits, size, null) : new SimpleBitStorage(bits, size);
     }
 
     public static SimpleBitStorage create(int bits, int size, long[] data) {
-        return new RustBitStorage(bits, size, data);
+        return RUST ? new RustBitStorage(bits, size, data) : new SimpleBitStorage(bits, size, data);
     }
 
     public static SimpleBitStorage create(int bits, int size, int[] values) {
+        if (!RUST) {
+            return new SimpleBitStorage(bits, size, values);
+        }
         RustBitStorage s = new RustBitStorage(bits, size, null);
         s.pack(values);
         return s;
@@ -204,6 +220,25 @@ public final class RustBitStorage extends SimpleBitStorage {
             for (int j = 0; j < valuesPerLong && i < size; j++) {
                 output[i++] = (int) (w & mask);
                 w >>= bits;
+            }
+        }
+    }
+
+    /**
+     * Sodium's {@code SimpleBitStorageMixin.sodium$unpack}, which it adds to the parent to copy a section for its
+     * chunk meshes: it reads the parent's words, which hold nothing here, so the same from Rust's.
+     */
+    public <T> void sodium$unpack(T[] out, net.minecraft.world.level.chunk.Palette<T> palette) {
+        int i = 0;
+        for (int cell = 0; cell < count; cell++) {
+            long w = word(cell);
+            for (int j = 0; j < valuesPerLong; j++) {
+                out[i] = java.util.Objects.requireNonNull(palette.valueFor((int) (w & mask)),
+                        "Palette does not contain entry for value in storage");
+                w >>= bits;
+                if (++i >= size) {
+                    return;
+                }
             }
         }
     }
