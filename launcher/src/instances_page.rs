@@ -67,6 +67,8 @@ pub(super) struct InstanceDialog {
     pub(super) copying: bool,
     /// A Java instance's maximum memory as set in the sheet, kept with Save: None until changed.
     pub(super) memory: Option<u32>,
+    /// A Java instance's Horizon accelerators as flipped in the sheet, kept with Save: None until flipped.
+    pub(super) accel: Option<bool>,
 }
 
 /// The instances and their icons as images, kept between frames.
@@ -353,6 +355,7 @@ impl Launcher {
             discarding: false,
             copying: false,
             memory: None,
+            accel: None,
             picture: None,
             editing: editing.map(|i| i.id),
             copy: false,
@@ -493,6 +496,7 @@ impl Launcher {
             .map(|p| p.as_ref().map(|c| c.png.clone()));
         let editing = d.editing.clone();
         let edited = editing.is_some();
+        let accel = d.accel;
         let copy = selected.filter(|_| d.copy);
         // The picture choice this save keeps: once kept, it is no longer an unsaved edit.
         let sent_picture = picture.clone();
@@ -558,6 +562,15 @@ impl Launcher {
                 if let Some(game) = m.java.as_mut().filter(|_| edited) {
                     game.jvm_args = jvm_args;
                     game.window = window;
+                    if let Some(on) = accel {
+                        game.accel = if on {
+                            horizon_launcher::java_accel::KINDS
+                                .map(String::from)
+                                .to_vec()
+                        } else {
+                            Vec::new()
+                        };
+                    }
                     if let Some(memory) = memory {
                         game.memory_mb = Some(memory);
                     }

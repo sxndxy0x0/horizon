@@ -521,10 +521,17 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
 | Fabric 26.3 + Fabric API + C2ME | wgpu (Vulkan) | Java (C2ME แก้ `LayerLightSectionStorage`) | ได้ |
 | Fabric 26.3 + ม็อดทั้ง 22 ตัวในเครื่อง | OpenGL (Iris, Sodium, TL Skin Cape วาดเอง) | Java (C2ME) | ได้ |
 | NeoForge 26.3.0.118 | wgpu (Vulkan) | Rust ทั้ง server และ client | ได้ |
+| Forge 26.3-66.1.9 | wgpu | Rust ทั้ง server และ client | ได้ |
+
+- **Forge:** ModLauncher เก็บ jar ไว้ใน file system ของตัวเอง (URL แบบ `union:`) ที่ `File` เปิดไม่ได้ การตรวจ bytes เลยหา jar ไม่เจอและแสงตกไปเป็น Java ทุกครั้ง ตอนนี้อ่าน bytes ใน jar ผ่าน `getResourceAsStream` ของ loader ก่อน แล้วค่อยลองจาก code source
+- **NeoForge และ Forge ถามแสงของบล็อกตามตำแหน่ง:** `BlockLightEngine.getEmission` ของทั้งสองเรียก `getLightEmission(level, pos)` (เป็นจุดเดียวที่ต่างจาก vanilla ใน engine แสง) บล็อกที่ให้แสงตามตำแหน่งจึงเก็บเป็นคลาสของ state ไม่ได้
+  - ตอนเริ่ม `RustLight` จะไล่ทุกบล็อกที่ลงทะเบียน ถ้ามีคลาสไหนประกาศ `getLightEmission(BlockState, BlockGetter, BlockPos)` เอง แสงจะเป็นของ Java และบอกชื่อบล็อกใน log
+  - NeoForge และ Forge ล้วน ไม่มีบล็อกแบบนั้น จึงยังเร่งได้
 
 ### launcher
 
 - **`instance java <INSTANCE> --accel light,wgpu` (หรือ `off`):** เก็บใน `JavaGame.accel` ของ instance
+- **หน้าตั้งค่า instance, แท็บ Launch:** สวิตช์ "Horizon accelerators" ในกลุ่ม "Java and the window" เปิดทั้งสองอย่างหรือปิดทั้งหมด เก็บเมื่อกด Save เหมือนแถวอื่นของแท็บ
 - **ตอนเริ่มเกม (`backend.rs` → `java_accel::jvm_args`):** ใส่ `--enable-native-access=ALL-UNNAMED`, `-javaagent:…/horizon-accel.jar` และ `-Dhorizon.accel=…` ก่อน JVM argument ของผู้เล่น
   - เฉพาะเวอร์ชันที่ agent สร้างมาสำหรับ (26.3) และเมื่อ launcher มีไฟล์ของ agent (`java-accel/` ข้าง launcher หรือ `HORIZON_JAVA_ACCEL`)
   - ไม่เข้าเงื่อนไขก็เริ่มเกมตามปกติ และบอกเหตุผลใน log ของการเปิดเกม
@@ -540,6 +547,8 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
   - คอมไพล์ด้วย `javac` ข้าง Java ที่ instance ใช้ (runtime ของ Mojang สำหรับ 26.3 มี `javac`) กับ classpath ของเกม vanilla ของผู้เล่น
   - ASM ใช้ชุดใน `libraries/` ถ้ามี (Fabric/NeoForge ติดตั้งไว้) ไม่งั้นดาวน์โหลดจาก Maven Central แล้วตรวจ SHA-256
   - ผลเก็บไว้ใน `java-accel/<key>/` ของข้อมูล launcher key คือ hash ของ source, ไลบรารี native, ASM และ jar ของเกม
+- **checksum ของ ASM 9.9.1 ที่ pin ไว้ตรงกับ Maven Central:** (`asm` และ `asm-tree`, เทียบกับ `.sha1` ที่ Maven Central ประกาศ)
+- **`xtask package`:** เทสต์ `the_java_agent_libraries_go_into_java_accel_when_built` ตรวจว่าไลบรารีทั้งสองถูกคัดลอกเข้า `java-accel/` เมื่อ build แล้ว และไม่สร้างโฟลเดอร์ถ้าขาดตัวใดตัวหนึ่ง
 - **ผล:** เทสต์ของ launcher (`bundle_compiles_against_the_players_game`, ignore เพราะต้องมีเกมของผู้เล่น) คอมไพล์ใน 10 วินาที ครั้งที่สองใช้ของเดิมทันที และ bundle ที่ได้เปิดเกมจริงบน Fabric + Fabric API ได้ (แสง Rust ทั้งสองฝั่ง, wgpu)
 - **บั๊กที่เจอระหว่างทาง:** JVM อ่าน signature ของทุก method ในคลาส premain ก่อนเรียก `premain` ถ้ามีชนิดของ ASM อยู่ใน signature, vanilla (ไม่มี ASM บน class path) จะล้มก่อน agent ได้เติม ASM ส่วนที่ใช้ ASM ทั้งหมดจึงอยู่ใน `Rewrites`
 
@@ -548,15 +557,17 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
 - logger ที่ใส่ใน P3 จับได้ระหว่างทดสอบรอบนี้: ไดรเวอร์ AMD ตอบ `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` ของหน้าต่างทดสอบ (หน้าต่างซ่อน 16×16 ที่ใช้เลือก API) ว่า `VK_ERROR_UNKNOWN` เป็นบางครั้ง
 - ช่วงที่เป็น อาการคงอยู่ทุกครั้ง: ลองซ้ำ 5 ครั้งห่างกัน 100 ms ไม่ช่วย, หน้าต่างแบบมองเห็นก็ไม่ช่วย, ปิด implicit layer ทั้งหมด (`VK_LOADER_LAYERS_DISABLE=~implicit~`) ก็ไม่ช่วย ขณะที่ Vulkan ของ Mojang ขึ้นจอได้ในเวลาเดียวกัน
 - จึงยังไม่รู้สาเหตุจริง ช่วงนั้น wgpu ใช้ DX12 ซึ่งตอนนี้ตรง OpenGL ทุก pixel ที่หน้า title (P3) ส่วนในโลกที่ต่างเกิน noise ระหว่างรอบมีแค่ผิวน้ำ จึงไม่ทำให้ภาพผิด
-- ทางที่น่าลองต่อ: สร้าง surface ผ่าน `SDL_Vulkan_CreateSurface` แบบที่ Mojang ทำ แทน `vkCreateWin32SurfaceKHR` ของ wgpu
+- **ลองแบบที่ Mojang ทำแล้ว ไม่ช่วย:**
+  - `VulkanBackend` ของ Mojang สร้างหน้าต่างด้วย `SDL_WINDOW_VULKAN` และ `SDL_Vulkan_CreateSurface` ของ SDL ก็เรียก `vkCreateWin32SurfaceKHR` ด้วย HWND/HINSTANCE ชุดเดียวกับที่ wgpu ได้
+  - wgpu ถาม `vkGetPhysicalDeviceSurfaceSupportKHR` แล้ว `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` เหมือนกัน
+  - ใส่ `SDL_WINDOW_VULKAN` ให้ทั้งหน้าต่างทดสอบและหน้าต่างเกม: ยัง `VK_ERROR_UNKNOWN` ครบ 5 ครั้งทั้งสองรอบ จึงไม่ได้เก็บไว้ (flag นี้ทำให้ SDL โหลดไลบรารี Vulkan ก่อน `VulkanBackend.loadLibrary` ซึ่งอาจทำให้ Vulkan ของ Mojang ที่เป็นตัวสำรองล้ม)
+  - ที่ต่างกันจริงเหลือแค่ VkInstance (extension ที่ wgpu เปิด) ถ้าจะตามต่อ ต้องลองปิด extension ทีละตัวใน `third_party/wgpu-hal`
 
 ### ที่ยังเหลือของ P5
 
 - **release ของ Horizon ยังไม่ได้ลองสร้างจริงใน CI:** ขั้นใน `game-build.yml` และ `xtask package` เขียนแล้ว แต่ยังไม่ได้รัน
-- **checksum ของ ASM ที่ pin ไว้มาจากสำเนาในเครื่อง** (ที่ตัวติดตั้งของ Fabric/NeoForge วางไว้) ยังไม่ได้เทียบกับ Maven Central ถ้าไม่ตรง การดาวน์โหลดจะถูกปฏิเสธและเกมเริ่มโดยไม่เร่ง
-- **Forge และ Quilt ยังไม่ได้ทดสอบ:** (Quilt บูต 26.3 ไม่ได้อยู่แล้ว ดู P1)
+- **Quilt ยังไม่ได้ทดสอบ:** Quilt บูต 26.3 ไม่ได้อยู่แล้ว (ดู P1)
 - **ยังไม่ได้เทียบภาพหรือแสงแบบทีละ pixel/chunk ใต้ loader:** การทดสอบตอนนี้ดูว่าเร่งจริงและเล่นได้ ส่วนความตรงพิสูจน์ใน P3/P4 บน class path ธรรมดา
-- **หน้าตั้งค่าใน launcher:** ตอนนี้มีแค่ CLI
 - **ชื่อของไลบรารี native ยังเป็นของตัวทดลอง (`horizon_shm_probe`):** ควรแยก crate ของจริงออกมา
 
 ## เอาอะไรจาก forge/ari มาใช้

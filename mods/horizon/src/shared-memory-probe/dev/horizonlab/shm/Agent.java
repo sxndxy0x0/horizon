@@ -55,7 +55,7 @@ public final class Agent {
                 if (name == null || !name.startsWith("net/minecraft/")) {
                     return null;
                 }
-                Rewrites.guard(domain, name, bytes);
+                Rewrites.guard(loader, domain, name, bytes);
                 try {
                     return rewrite(name, bytes);
                 } catch (RuntimeException e) {

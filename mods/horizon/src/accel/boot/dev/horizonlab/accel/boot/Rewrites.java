@@ -67,23 +67,36 @@ public final class Rewrites {
     }
 
     /** Records, for a guarded light class ({@link LightNames}), whether it is defined with its jar's own bytes. */
-    public static void guard(ProtectionDomain domain, String name, byte[] bytes) {
+    public static void guard(ClassLoader loader, ProtectionDomain domain, String name, byte[] bytes) {
         if (light() == null) {
             return;
         }
         for (String g : LightNames.GUARDED) {
             if (g.equals(name)) {
-                LightNames.VANILLA_BYTES.put(name, sameAsJar(domain, name, bytes));
+                byte[] jar = jarBytes(loader, domain, name);
+                LightNames.VANILLA_BYTES.put(name, jar != null && Arrays.equals(jar, bytes));
             } else if (g.startsWith(name + ".")) {
                 String method = g.substring(name.length() + 1);
-                byte[] jar = jarBytes(domain, name);
+                byte[] jar = jarBytes(loader, domain, name);
                 LightNames.VANILLA_BYTES.put(g, jar != null && code(bytes, method).equals(code(jar, method)));
             }
         }
     }
 
-    /** The class's bytes in its jar, or null. */
-    static byte[] jarBytes(ProtectionDomain domain, String name) {
+    /**
+     * The class's bytes as its jar holds them, or null: from the loader's own resources first (ModLauncher's jars,
+     * Forge's, are on a file system of its own, under URLs a {@code File} cannot open), else the code source's jar.
+     */
+    static byte[] jarBytes(ClassLoader loader, ProtectionDomain domain, String name) {
+        if (loader != null) {
+            try (java.io.InputStream in = loader.getResourceAsStream(name + ".class")) {
+                if (in != null) {
+                    return in.readAllBytes();
+                }
+            } catch (java.io.IOException e) {
+                // The code source's jar, then.
+            }
+        }
         try {
             java.net.URL where = domain == null || domain.getCodeSource() == null ? null
                     : domain.getCodeSource().getLocation();

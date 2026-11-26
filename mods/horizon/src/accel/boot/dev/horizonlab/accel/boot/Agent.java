@@ -78,7 +78,7 @@ public final class Agent {
                     return null;
                 }
                 try {
-                    Rewrites.guard(domain, name, bytes);
+                    Rewrites.guard(loader, domain, name, bytes);
                     boolean backends = wgpu && name.equals(BACKENDS);
                     if (!backends && !Rewrites.wanted(name, bytes)) {
                         return null;

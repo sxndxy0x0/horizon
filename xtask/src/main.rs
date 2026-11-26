@@ -417,7 +417,10 @@ fn copy_java_accel(binary: &Path, out: &Path) -> Result<(), String> {
         .filter(|p| p.is_file())
         .collect();
     if found.len() != JAVA_ACCEL.len() {
-        eprintln!("no java-accel/: the agent's native libraries are not beside {}", binary.display());
+        eprintln!(
+            "no java-accel/: the agent's native libraries are not beside {}",
+            binary.display()
+        );
         return Ok(());
     }
     let to = out.join("java-accel");
@@ -648,6 +651,39 @@ mod tests {
         tar.extend(header(name, mode, data.len(), kind));
         tar.extend(data);
         tar.resize(tar.len().div_ceil(512) * 512, 0);
+    }
+
+    #[test]
+    fn the_java_agent_libraries_go_into_java_accel_when_built() {
+        let base = std::env::temp_dir().join(format!("xtask-accel-{}", std::process::id()));
+        let (bin, out) = (base.join("target"), base.join("dist"));
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        let binary = bin.join(if cfg!(windows) {
+            "horizon-client.exe"
+        } else {
+            "horizon-client"
+        });
+        fs::write(&binary, b"").unwrap();
+        let name = |c: &str| {
+            if cfg!(windows) {
+                format!("{c}.dll")
+            } else if cfg!(target_os = "macos") {
+                format!("lib{c}.dylib")
+            } else {
+                format!("lib{c}.so")
+            }
+        };
+        // Only one of the two built: nothing is copied.
+        fs::write(bin.join(name(JAVA_ACCEL[0])), b"one").unwrap();
+        copy_java_accel(&binary, &out).unwrap();
+        assert!(!out.join("java-accel").exists());
+        fs::write(bin.join(name(JAVA_ACCEL[1])), b"two").unwrap();
+        copy_java_accel(&binary, &out).unwrap();
+        for c in JAVA_ACCEL {
+            assert!(out.join("java-accel").join(name(c)).is_file(), "{c}");
+        }
+        fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

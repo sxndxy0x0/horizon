@@ -125,6 +125,8 @@ struct Draft {
     switches: Option<[bool; 3]>,
     /// A Java instance's maximum memory, once changed; Err while the box holds no size.
     memory: Result<Option<u32>, ()>,
+    /// A Java instance's Horizon accelerators, once flipped.
+    accel: Option<bool>,
 }
 
 impl Draft {
@@ -146,13 +148,14 @@ impl Draft {
                 .as_ref()
                 .is_some_and(|(pin, channel)| *pin != saved.version || *channel != saved.channel);
         let launch = saved.java.as_ref().is_some_and(|j| {
-            self.java
-                != (
-                    j.jvm_args.trim().to_string(),
-                    j.window
-                        .map(|(w, h)| (w.to_string(), h.to_string()))
-                        .unwrap_or_default(),
-                )
+            self.accel.is_some_and(|on| on != !j.accel.is_empty())
+                || self.java
+                    != (
+                        j.jvm_args.trim().to_string(),
+                        j.window
+                            .map(|(w, h)| (w.to_string(), h.to_string()))
+                            .unwrap_or_default(),
+                    )
                 || match self.memory {
                     Ok(memory) => memory.is_some_and(|mb| {
                         mb != j.memory_mb.unwrap_or(instances::DEFAULT_MEMORY_MB)
@@ -217,6 +220,7 @@ impl Launcher {
             hooks: self.hooks_typed(&saved.id),
             switches: self.switches_typed(&saved.id),
             memory: self.sheet_memory(),
+            accel: d.accel,
         };
         draft.changed(saved)
     }
@@ -786,15 +790,52 @@ impl Launcher {
         group(None, rows)
     }
 
-    /// Launch's rows for a Java instance: its own JVM arguments and the game window's size, kept
-    /// by the sheet's Save.
+    /// Launch's rows for a Java instance: Horizon's accelerators, its own JVM arguments and the game
+    /// window's size, kept by the sheet's Save.
     fn sheet_java(&mut self, cx: &mut Context<Self>) -> Div {
         let args = self.field(Field::JavaArgs, tr("For example -XX:+UseZGC"), 560., cx);
         let width = self.field(Field::WindowWidth, "854", 84., cx).w(px(84.));
         let height = self.field(Field::WindowHeight, "480", 84., cx).w(px(84.));
+        let t = self.theme;
+        let saved_accel = self
+            .instances
+            .dialog
+            .as_ref()
+            .and_then(|d| d.editing.as_ref())
+            .and_then(|id| self.instances.list.iter().find(|i| &i.id == id))
+            .and_then(|i| i.java.as_ref())
+            .is_some_and(|j| !j.accel.is_empty());
+        let accel = self
+            .instances
+            .dialog
+            .as_ref()
+            .and_then(|d| d.accel)
+            .unwrap_or(saved_accel);
+        let accel_toggle = ui::toggle(
+            "sheet-accel",
+            accel,
+            self.look.accent,
+            self.look.on_accent,
+            &t,
+        )
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            if let Some(d) = this.instances.dialog.as_mut() {
+                d.accel = Some(!accel);
+            }
+            cx.notify();
+        }));
         group(
             Some(tr("Java and the window").into()),
             div()
+                .child(ui::setting_row(
+                    tr("Horizon accelerators"),
+                    Some(
+                        div()
+                            .child(tr("Light in Rust and drawing through Horizon's renderer, for Minecraft 26.3. Any part a mod changes stays the game's own."))
+                            .into_any_element(),
+                    ),
+                    Some(accel_toggle.into_any_element()),
+                ))
                 .child(ui::setting_row_stacked(
                     tr("Java arguments"),
                     Some(
@@ -1014,6 +1055,7 @@ mod tests {
             hooks: None,
             switches: None,
             memory: Ok(None),
+            accel: None,
         }
     }
 
@@ -1047,6 +1089,20 @@ mod tests {
         // Text in the box that isn't a size is an edit too, until it is fixed.
         draft.memory = Err(());
         assert_eq!(draft.changed(&saved), vec![SheetTab::Launch]);
+    }
+
+    #[test]
+    fn the_accelerator_toggle_waits_for_save_until_flipped_back() {
+        let mut saved = saved();
+        saved.java = Some(instances::JavaGame::default());
+        let mut draft = untouched(&saved);
+        draft.plays = Plays::of(&saved);
+        draft.accel = Some(false);
+        assert!(draft.changed(&saved).is_empty());
+        draft.accel = Some(true);
+        assert_eq!(draft.changed(&saved), vec![SheetTab::Launch]);
+        saved.java.as_mut().unwrap().accel = vec!["light".into()];
+        assert!(draft.changed(&saved).is_empty());
     }
 
     #[test]

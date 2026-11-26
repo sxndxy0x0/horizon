@@ -95,7 +95,8 @@ READERS = {
     # Commands (tokens, icons, package), not tests: listed so the scan finds nothing unexplained.
     "xtask": [
         "crates/horizon-client/src", "crates/horizon-mod-vocab/src/hooks", "crates/horizon-perf/web",
-        "crates/horizon-prepare", "crates/horizon-theme", "docs/media/brand", "mods/horizon/src/test/java", "packaging",
+        "crates/horizon-prepare", "crates/horizon-theme", "docs/media/brand", "mods/horizon/src/accel",
+        "mods/horizon/src/test/java", "packaging",
         "research-lock.json", "tools",
     ],
 }

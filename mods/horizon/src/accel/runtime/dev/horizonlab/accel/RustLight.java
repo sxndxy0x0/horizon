@@ -236,9 +236,37 @@ public final class RustLight {
             if (!f) {
                 System.out.println("[shm] " + CLASS_IDS.size() + " light classes: more than a byte holds, light stays Java");
             }
+            String positional = positionalEmission();
+            if (f && positional != null) {
+                // NeoForge's and Forge's BlockLightEngine.getEmission asks getLightEmission(level, pos): a block that
+                // answers by where it is cannot be a class of its state.
+                System.out.println("[shm] light stays Java: " + positional + " gives off light by where it is");
+                f = false;
+            }
             fit = f;
         }
         return f;
+    }
+
+    /**
+     * A block whose class (below {@code Block}) declares {@code getLightEmission(BlockState, BlockGetter, BlockPos)}:
+     * NeoForge's and Forge's position-aware emission, which their light engine asks. Vanilla and Fabric have no such
+     * method, so none.
+     */
+    static String positionalEmission() {
+        for (Block block : net.minecraft.core.registries.BuiltInRegistries.BLOCK) {
+            for (Class<?> c = block.getClass(); c != null && c != Block.class; c = c.getSuperclass()) {
+                for (java.lang.reflect.Method m : c.getDeclaredMethods()) {
+                    Class<?>[] p = m.getParameterTypes();
+                    if (m.getName().equals("getLightEmission") && p.length == 3 && p[0] == BlockState.class
+                            && p[2] == BlockPos.class) {
+                        return net.minecraft.core.registries.BuiltInRegistries.BLOCK.getKey(block) + " ("
+                                + c.getName() + ")";
+                    }
+                }
+            }
+        }
+        return null;
     }
 
     // -- The engine ----------------------------------------------------------------------------------------------
