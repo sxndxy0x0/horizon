@@ -16,13 +16,6 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
-import org.objectweb.asm.ClassReader;
-import org.objectweb.asm.ClassWriter;
-import org.objectweb.asm.Opcodes;
-import org.objectweb.asm.tree.AbstractInsnNode;
-import org.objectweb.asm.tree.ClassNode;
-import org.objectweb.asm.tree.MethodInsnNode;
-import org.objectweb.asm.tree.MethodNode;
 
 /**
  * Horizon's agent for the real Minecraft: Java Edition, under any loader (the launcher adds it with
@@ -90,17 +83,11 @@ public final class Agent {
                     if (!backends && !Rewrites.wanted(name, bytes)) {
                         return null;
                     }
-                    ClassNode node = new ClassNode();
-                    new ClassReader(bytes).accept(node, 0);
-                    boolean changed = Rewrites.apply(node);
-                    changed |= backends && wgpuFirst(node);
-                    if (!changed) {
-                        return null;
+                    byte[] edited = Rewrites.edit(bytes, backends);
+                    if (edited != null) {
+                        inject(loader, domain);
                     }
-                    inject(loader, domain);
-                    ClassWriter writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
-                    node.accept(writer);
-                    return writer.toByteArray();
+                    return edited;
                 } catch (Throwable t) {
                     System.out.println("[horizon-accel] left " + name + " as it is: " + t);
                     return null;
@@ -182,7 +169,7 @@ public final class Agent {
         List<String> order = new ArrayList<>();
         Set<String> placed = new HashSet<>();
         for (String name : runtime.keySet()) {
-            place(name, order, placed);
+            Rewrites.order(name, runtime, order, placed);
         }
         for (String name : order) {
             byte[] bytes = runtime.get(name);
@@ -195,38 +182,4 @@ public final class Agent {
         System.out.println("[horizon-accel] runtime in " + loader.getClass().getName());
     }
 
-    private static void place(String name, List<String> order, Set<String> placed) {
-        if (!runtime.containsKey(name) || !placed.add(name)) {
-            return;
-        }
-        ClassReader r = new ClassReader(runtime.get(name));
-        place(r.getSuperName(), order, placed);
-        for (String i : r.getInterfaces()) {
-            place(i, order, placed);
-        }
-        order.add(name);
-    }
-
-    /**
-     * Horizon's wgpu backend before the game's own: before each return of
-     * {@code PreferredGraphicsApi.getBackendsToTry}, {@code Backends.withWgpu(theGamesList)}. A machine wgpu cannot
-     * draw on starts on the game's OpenGL or Vulkan.
-     */
-    static boolean wgpuFirst(ClassNode node) {
-        boolean changed = false;
-        for (MethodNode m : node.methods) {
-            if (!m.name.equals("getBackendsToTry")) {
-                continue;
-            }
-            for (AbstractInsnNode insn : m.instructions.toArray()) {
-                if (insn.getOpcode() == Opcodes.ARETURN) {
-                    m.instructions.insertBefore(insn, new MethodInsnNode(Opcodes.INVOKESTATIC,
-                            "dev/horizonlab/wgpu/Backends", "withWgpu",
-                            "([L" + GPU_BACKEND + ";)[L" + GPU_BACKEND + ";", false));
-                    changed = true;
-                }
-            }
-        }
-        return changed;
-    }
 }

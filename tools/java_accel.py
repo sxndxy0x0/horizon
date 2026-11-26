@@ -134,7 +134,7 @@ def run(args) -> int:
     loader_probe.extract_natives([j for j in jars if j.exists()], natives)
     assets = shared_memory_probe_assets(player if not (mc / "assets" / "objects").exists() else mc, profile_json,
                                         versions, out)
-    jar = OUT / "horizon-accel.jar"
+    jar = (args.agent_dir or OUT).resolve() / "horizon-accel.jar"
     if not jar.exists():
         print(f"no {jar}: run `python tools/java_accel.py build` first", file=sys.stderr)
         return 1
@@ -143,7 +143,7 @@ def run(args) -> int:
     # As the version file asks (its jvm arguments, which a launcher passes): a stack shadow zone native code fits.
     cmd = [java, "-Xmx3g", "-Xss1M", "-XX:StackShadowPages=32", "--enable-native-access=ALL-UNNAMED",
            f"-Djava.library.path={natives}",
-           f"-javaagent:{jar}", f"-Dhorizon.accel={args.accel}",
+           f"-javaagent:{jar}", f"-Dhorizon.accel={args.accel}", *os.environ.get("HZ_JVM_EXTRA", "").split(),
            f"-Dfabric.gameJarPath={game_jar}", *loader_probe.profile_args(profile_json, versions, libraries, "jvm"),
            "-cp", os.pathsep.join(map(str, [*libs, game_jar])), main_class,
            *loader_probe.profile_args(profile_json, versions, libraries, "game"),
@@ -228,6 +228,7 @@ def main() -> int:
     r.add_argument("--world", type=Path, required=True, help="a save to play (copied)")
     r.add_argument("--accel", default="light,wgpu", help="what the agent accelerates: light, wgpu (comma-separated)")
     r.add_argument("--out", type=Path)
+    r.add_argument("--agent-dir", type=Path, help="a built agent folder (default: .local/java-accel, from build)")
     r.add_argument("--player-minecraft", type=Path, default=default_mc,
                    help="the player's launcher folder, for libraries and assets a --minecraft folder lacks (read only)")
     r.add_argument("--mods", type=Path, nargs="*", default=[], help="mod jars to play with (copied)")

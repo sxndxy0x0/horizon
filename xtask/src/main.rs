@@ -41,13 +41,21 @@ use std::process::{Command, ExitCode};
 const USAGE: &str = "usage: cargo run -p xtask -- package BINARY OUTDIR | package-server ENGINE OUTDIR | mod-api [notes|coverage] | tokens | icons | perf-wasm | mixins-tool release | mixins-tool patch SOURCE | mixins-tool identity TARGET | sdk-index DIST COMMIT DATE [--nightly NAME] [--previous BUILD DIFF]";
 
 /// What the release folder takes from the repository at HEAD, as `git archive` writes it.
-const ARCHIVED: [&str; 5] = [
+const ARCHIVED: [&str; 6] = [
     "tools",
     "mods/horizon/src/test/java",
+    // The sources of Horizon's agent for the real Java game, which the launcher compiles on the player's machine
+    // against their own game (docs/design/java-mods-everything.md, P5; launcher/src/java_accel.rs).
+    "mods/horizon/src/accel",
     "crates/horizon-prepare",
     "research-lock.json",
     "LICENSE",
 ];
+
+/// The agent's native libraries (crates `horizon-shm-probe` and `horizon-wgpu-backend`), copied from beside the
+/// game binary into `java-accel/`. A build without them packages without them: the launcher then starts Java
+/// instances without Horizon's accelerators.
+const JAVA_ACCEL: [&str; 2] = ["horizon_shm_probe", "horizon_wgpu_backend"];
 
 // The programs that sit beside the client (horizon-ctl, the command line and MCP server that play
 // the game; horizon-prepare, which prepares the resources from the player's own Minecraft;
@@ -369,6 +377,7 @@ fn package(binary: &Path, out: &Path) -> Result<(), String> {
     let repo = new_folder(out)?;
     copy_into(binary, out)?;
     copy_runtime("package", binary, out)?;
+    copy_java_accel(binary, out)?;
     copy_exporters(&repo.join("exporters"), &out.join("exporters"))?;
     let play = repo.join("packaging/PLAY.txt");
     copy(&play, &out.join("PLAY.txt"))
@@ -388,6 +397,35 @@ fn preflight(route: &str, program: &Path) -> Result<(), String> {
     horizon_mod_package::sdk::inputs()
         .check(route, program, &repo_root()?)
         .map_err(|refusal| refusal.to_string())
+}
+
+/// [`JAVA_ACCEL`]'s libraries from beside `binary` into `out/java-accel/`, those that were built.
+fn copy_java_accel(binary: &Path, out: &Path) -> Result<(), String> {
+    let dir = binary.parent().unwrap_or(Path::new("."));
+    let name = |crate_name: &str| {
+        if cfg!(windows) || binary.extension().is_some_and(|e| e == "exe") {
+            format!("{crate_name}.dll")
+        } else if cfg!(target_os = "macos") {
+            format!("lib{crate_name}.dylib")
+        } else {
+            format!("lib{crate_name}.so")
+        }
+    };
+    let found: Vec<PathBuf> = JAVA_ACCEL
+        .iter()
+        .map(|c| dir.join(name(c)))
+        .filter(|p| p.is_file())
+        .collect();
+    if found.len() != JAVA_ACCEL.len() {
+        eprintln!("no java-accel/: the agent's native libraries are not beside {}", binary.display());
+        return Ok(());
+    }
+    let to = out.join("java-accel");
+    fs::create_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
+    for lib in found {
+        copy_into(&lib, &to)?;
+    }
+    Ok(())
 }
 
 /// Release builds supply only our compiled classes and their integrity manifest (a required

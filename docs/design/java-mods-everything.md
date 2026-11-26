@@ -529,12 +529,31 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
   - เฉพาะเวอร์ชันที่ agent สร้างมาสำหรับ (26.3) และเมื่อ launcher มีไฟล์ของ agent (`java-accel/` ข้าง launcher หรือ `HORIZON_JAVA_ACCEL`)
   - ไม่เข้าเงื่อนไขก็เริ่มเกมตามปกติ และบอกเหตุผลใน log ของการเปิดเกม
 
+### การส่งไปถึงผู้เล่น
+
+แบบเดียวกับ exporter ของ `horizon-prepare`: ส่งเฉพาะโค้ดของ Horizon ส่วนเกมเป็นของผู้เล่น
+
+- **release ของ Horizon (เกม) พกสองอย่าง:** source ของ agent (`mods/horizon/src/accel`, เพิ่มใน `ARCHIVED` ของ `xtask`) และไลบรารี native สองตัวใน `java-accel/` (CI build ใน `game-build.yml`, `xtask package` คัดลอกจากข้างตัวเกม)
+  - launcher ส่งเป็นไฟล์เดียว จึงไม่พกไฟล์เหล่านี้เอง
+- **launcher คอมไพล์ agent บนเครื่องผู้เล่น (`java_accel::bundle`):** ตอนเริ่ม Java instance ที่เปิด `--accel`
+  - ใช้ Horizon เวอร์ชันล่าสุดที่ติดตั้งและมีของครบ
+  - คอมไพล์ด้วย `javac` ข้าง Java ที่ instance ใช้ (runtime ของ Mojang สำหรับ 26.3 มี `javac`) กับ classpath ของเกม vanilla ของผู้เล่น
+  - ASM ใช้ชุดใน `libraries/` ถ้ามี (Fabric/NeoForge ติดตั้งไว้) ไม่งั้นดาวน์โหลดจาก Maven Central แล้วตรวจ SHA-256
+  - ผลเก็บไว้ใน `java-accel/<key>/` ของข้อมูล launcher key คือ hash ของ source, ไลบรารี native, ASM และ jar ของเกม
+- **ผล:** เทสต์ของ launcher (`bundle_compiles_against_the_players_game`, ignore เพราะต้องมีเกมของผู้เล่น) คอมไพล์ใน 10 วินาที ครั้งที่สองใช้ของเดิมทันที และ bundle ที่ได้เปิดเกมจริงบน Fabric + Fabric API ได้ (แสง Rust ทั้งสองฝั่ง, wgpu)
+- **บั๊กที่เจอระหว่างทาง:** JVM อ่าน signature ของทุก method ในคลาส premain ก่อนเรียก `premain` ถ้ามีชนิดของ ASM อยู่ใน signature, vanilla (ไม่มี ASM บน class path) จะล้มก่อน agent ได้เติม ASM ส่วนที่ใช้ ASM ทั้งหมดจึงอยู่ใน `Rewrites`
+
+### Vulkan ของ wgpu ไม่รับหน้าต่าง: เจอสาเหตุแล้ว
+
+- logger ที่ใส่ใน P3 จับได้ระหว่างทดสอบรอบนี้: ไดรเวอร์ AMD ตอบ `vkGetPhysicalDeviceSurfaceCapabilitiesKHR` ของหน้าต่างทดสอบ (หน้าต่างซ่อน 16×16 ที่ใช้เลือก API) ว่า `VK_ERROR_UNKNOWN` เป็นบางครั้ง
+- ช่วงที่เป็น อาการคงอยู่ทุกครั้ง: ลองซ้ำ 5 ครั้งห่างกัน 100 ms ไม่ช่วย, หน้าต่างแบบมองเห็นก็ไม่ช่วย, ปิด implicit layer ทั้งหมด (`VK_LOADER_LAYERS_DISABLE=~implicit~`) ก็ไม่ช่วย ขณะที่ Vulkan ของ Mojang ขึ้นจอได้ในเวลาเดียวกัน
+- จึงยังไม่รู้สาเหตุจริง ช่วงนั้น wgpu ใช้ DX12 ซึ่งตอนนี้ตรง OpenGL ทุก pixel ที่หน้า title (P3) ส่วนในโลกที่ต่างเกิน noise ระหว่างรอบมีแค่ผิวน้ำ จึงไม่ทำให้ภาพผิด
+- ทางที่น่าลองต่อ: สร้าง surface ผ่าน `SDL_Vulkan_CreateSurface` แบบที่ Mojang ทำ แทน `vkCreateWin32SurfaceKHR` ของ wgpu
+
 ### ที่ยังเหลือของ P5
 
-- **ส่งไฟล์ของ agent ไปกับ launcher:** (jar, ASM, ไลบรารี native) แนวทางคือทำแบบเดียวกับ exporter ของ `horizon-prepare`
-  - release ส่งเฉพาะคลาสของ Horizon เองที่คอมไพล์แล้ว ส่วน jar ของเกมยังเป็นของผู้เล่น
-  - ถ้า release ไม่มีชุดที่ตรงกับเวอร์ชัน launcher คอมไพล์บนเครื่องผู้เล่นด้วย JDK (`horizon_prepare::java::find`) กับ jar ของผู้เล่นเอง
-  - ไลบรารี native สร้างพร้อม launcher ตามปกติ
+- **release ของ Horizon ยังไม่ได้ลองสร้างจริงใน CI:** ขั้นใน `game-build.yml` และ `xtask package` เขียนแล้ว แต่ยังไม่ได้รัน
+- **checksum ของ ASM ที่ pin ไว้มาจากสำเนาในเครื่อง** (ที่ตัวติดตั้งของ Fabric/NeoForge วางไว้) ยังไม่ได้เทียบกับ Maven Central ถ้าไม่ตรง การดาวน์โหลดจะถูกปฏิเสธและเกมเริ่มโดยไม่เร่ง
 - **Forge และ Quilt ยังไม่ได้ทดสอบ:** (Quilt บูต 26.3 ไม่ได้อยู่แล้ว ดู P1)
 - **ยังไม่ได้เทียบภาพหรือแสงแบบทีละ pixel/chunk ใต้ loader:** การทดสอบตอนนี้ดูว่าเร่งจริงและเล่นได้ ส่วนความตรงพิสูจน์ใน P3/P4 บน class path ธรรมดา
 - **หน้าตั้งค่าใน launcher:** ตอนนี้มีแค่ CLI

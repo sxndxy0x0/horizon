@@ -826,29 +826,53 @@ pub unsafe extern "C" fn hz_create(probe: *const c_void) -> *mut Ctx {
         // Headless (HZ_WGPU_HEADLESS), frames are never shown: any adapter of the API will do.
         let headless = env("HZ_WGPU_HEADLESS").is_some();
         let target = unsafe { probe.cast::<WindowTarget>().as_ref() }.filter(|_| !headless);
-        let surface = match target {
-            None => None,
-            Some(t) => match unsafe { create_surface(&instance, t) } {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    eprintln!("[horizon-wgpu] {backends:?}: no surface for the window: {e}");
-                    continue;
-                }
-            },
+        // AMD's Vulkan driver at times answers vkGetPhysicalDeviceSurfaceCapabilitiesKHR with VK_ERROR_UNKNOWN for a
+        // while (hidden or shown window, implicit layers off, the game's own Vulkan presenting meanwhile): then the
+        // next API. Asking again in the moment does not help (docs/design/java-mods-everything.md, P5).
+        let tries = if backends == wgpu::Backends::VULKAN && target.is_some() {
+            5
+        } else {
+            1
         };
-        let adapter =
+        let mut found = None;
+        for attempt in 1..=tries {
+            let surface = match target {
+                None => None,
+                Some(t) => match unsafe { create_surface(&instance, t) } {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        eprintln!("[horizon-wgpu] {backends:?}: no surface for the window: {e}");
+                        break;
+                    }
+                },
+            };
             match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: surface.as_ref(),
                 ..Default::default()
             })) {
-                Ok(a) => a,
-                Err(e) => {
-                    eprintln!("[horizon-wgpu] {backends:?}: no adapter: {e}");
-                    continue;
+                Ok(a) => {
+                    if attempt > 1 {
+                        eprintln!(
+                            "[horizon-wgpu] {backends:?}: the window taken at attempt {attempt}"
+                        );
+                    }
+                    found = Some(a);
+                    break;
                 }
-            };
-        drop(surface);
+                Err(e) => {
+                    eprintln!(
+                        "[horizon-wgpu] {backends:?}: no adapter (attempt {attempt} of {tries}): {e}"
+                    );
+                    if attempt < tries {
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        }
+        let Some(adapter) = found else {
+            continue;
+        };
         chosen = Some((instance, adapter));
         break;
     }

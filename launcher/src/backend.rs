@@ -2072,7 +2072,8 @@ pub fn java_game(
             .join(format!("{id}.json")))
     };
     let vanilla = crate::java_launch::read(&file(&game.minecraft)?)?;
-    let need = crate::java::Need::of(&crate::java_launch::resolve(vanilla, &minecraft)?);
+    let vanilla = crate::java_launch::resolve(vanilla, &minecraft)?;
+    let need = crate::java::Need::of(&vanilla);
     let found = crate::java::pick(
         &need,
         game.home.as_deref(),
@@ -2105,17 +2106,15 @@ pub fn java_game(
     let version =
         crate::java_launch::resolve(crate::java_launch::read(&file(&start)?)?, &minecraft)?;
     // Horizon's accelerators first, so the player's own arguments can still change what they set.
-    let mut jvm_args = match crate::java_accel::jvm_args(
-        &game.accel,
-        &game.minecraft,
-        crate::java_accel::dir().as_deref(),
-    ) {
-        Ok(args) => args,
-        Err(why) => {
-            log(why);
-            Vec::new()
-        }
-    };
+    let accel_dir = java_accel_dir(game, &vanilla, &minecraft, &runtime.java(), log);
+    let mut jvm_args =
+        match crate::java_accel::jvm_args(&game.accel, &game.minecraft, accel_dir.as_deref()) {
+            Ok(args) => args,
+            Err(why) => {
+                log(why);
+                Vec::new()
+            }
+        };
     jvm_args.extend(game.jvm_args.split_whitespace().map(String::from));
     fs::create_dir_all(&instance.home).map_err(|e| format!("{}: {e}", instance.home.display()))?;
     crate::java_launch::command(
@@ -2135,6 +2134,42 @@ pub fn java_game(
             server,
         },
     )
+}
+
+/// The folder Horizon's agent starts the game from, when `game` turns accelerators on for a version the agent knows:
+/// a developer's ready one (`HORIZON_JAVA_ACCEL`), else compiled from the newest installed Horizon release that
+/// carries the agent, against this game ([`crate::java_accel::bundle`]). None says the game starts without it.
+fn java_accel_dir(
+    game: &crate::instances::JavaGame,
+    vanilla: &serde_json::Value,
+    minecraft: &Path,
+    java: &Path,
+    log: &dyn Fn(String),
+) -> Option<PathBuf> {
+    if game.accel.is_empty() || !crate::java_accel::VERSIONS.contains(&game.minecraft.as_str()) {
+        return None;
+    }
+    if let Some(dir) = crate::java_accel::dir() {
+        return Some(dir);
+    }
+    let roots: Vec<PathBuf> = installed().iter().map(|t| version_dir(t)).collect();
+    let root = crate::java_accel::release_root(&roots)?;
+    let classpath =
+        crate::java_launch::classpath(vanilla, minecraft, crate::java_launch::os_name()).ok()?;
+    let inputs = crate::java_accel::Inputs {
+        root: &root,
+        java,
+        classpath: &classpath,
+        libraries: &minecraft.join("libraries"),
+        cache: &data_dir().join("java-accel"),
+    };
+    match crate::java_accel::bundle(&inputs, &get_bytes, log) {
+        Ok(dir) => Some(dir),
+        Err(why) => {
+            log(why);
+            None
+        }
+    }
 }
 
 /// What [`download_for_owner`] does with the owner gate's answer: Mojang's files only for its

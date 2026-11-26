@@ -352,4 +352,58 @@ public final class Rewrites {
         node.fields.add(new FieldNode(Opcodes.ACC_PUBLIC, STATE_CLASS, "I", null, null));
         return true;
     }
+
+    /**
+     * Horizon's wgpu backend before the game's own: before each return of
+     * {@code PreferredGraphicsApi.getBackendsToTry}, {@code Backends.withWgpu(theGamesList)}. A machine wgpu cannot
+     * draw on starts on the game's OpenGL or Vulkan.
+     */
+    public static boolean wgpuFirst(ClassNode node) {
+        boolean changed = false;
+        for (MethodNode m : node.methods) {
+            if (!m.name.equals("getBackendsToTry")) {
+                continue;
+            }
+            for (AbstractInsnNode insn : m.instructions.toArray()) {
+                if (insn.getOpcode() == Opcodes.ARETURN) {
+                    m.instructions.insertBefore(insn, new MethodInsnNode(Opcodes.INVOKESTATIC,
+                            "dev/horizonlab/wgpu/Backends", "withWgpu",
+                            "([Lcom/mojang/renderpearl/api/device/GpuBackend;)[Lcom/mojang/renderpearl/api/device/GpuBackend;", false));
+                    changed = true;
+                }
+            }
+        }
+        return changed;
+    }
+
+    /**
+     * Every edit a class needs as the product agent makes them ({@link #apply}, and with {@code wgpuFirst}
+     * {@link #wgpuFirst}): its new bytes, or null when nothing changed. Here, not in {@link Agent}: the JVM reads the
+     * agent class's method signatures before {@code premain} can put ASM on the class path.
+     */
+    public static byte[] edit(byte[] bytes, boolean wgpuFirst) {
+        ClassNode node = new ClassNode();
+        new org.objectweb.asm.ClassReader(bytes).accept(node, 0);
+        boolean changed = apply(node);
+        changed |= wgpuFirst && wgpuFirst(node);
+        if (!changed) {
+            return null;
+        }
+        org.objectweb.asm.ClassWriter writer = new org.objectweb.asm.ClassWriter(org.objectweb.asm.ClassWriter.COMPUTE_MAXS);
+        node.accept(writer);
+        return writer.toByteArray();
+    }
+
+    /** {@code name} into {@code order} after the runtime classes it extends or implements. */
+    public static void order(String name, Map<String, byte[]> runtime, List<String> order, java.util.Set<String> placed) {
+        if (!runtime.containsKey(name) || !placed.add(name)) {
+            return;
+        }
+        org.objectweb.asm.ClassReader r = new org.objectweb.asm.ClassReader(runtime.get(name));
+        order(r.getSuperName(), runtime, order, placed);
+        for (String i : r.getInterfaces()) {
+            order(i, runtime, order, placed);
+        }
+        order.add(name);
+    }
 }
