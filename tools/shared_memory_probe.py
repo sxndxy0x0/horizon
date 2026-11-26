@@ -94,6 +94,12 @@ def main() -> int:
                     help="a folder with Horizon's facts.json, for the registry check (read only: it is copied)")
     ap.add_argument("--radius", type=int, default=6, help="chunks each way from 0, 0 in the world probe")
     ap.add_argument("--no-world", action="store_true", help="skip the world probe")
+    ap.add_argument("--light", action="store_true",
+                    help="P4 instead: the same saved world edited and lit by vanilla's light engine (twice) and by "
+                         "Rust's propagation (-Dhz.light=accel), compared chunk by chunk, with the time each spent")
+    ap.add_argument("--reuse", action="store_true", help="with --light: keep the generated world of a run before")
+    ap.add_argument("--rust-only", action="store_true",
+                    help="with --light: run only Rust's propagation, against the vanilla-engine runs of a run before")
     args = ap.parse_args()
 
     mc = args.minecraft.resolve()
@@ -121,6 +127,12 @@ def main() -> int:
     java = str(args.java_home / "bin" / "java") if args.java_home else "java"
     run_dir = out / "run"
     run_dir.mkdir(exist_ok=True)
+    if args.light:
+        ok, report = light(args, java, lib, jar, cp, out)
+        text = "\n".join(["# P4 report", "", *report]) + "\n"
+        (out / "light-report.md").write_text(text, encoding="utf-8")
+        print(text)
+        return 0 if ok else 1
 
     results = {}
     for mode in ("vanilla", "rust"):
@@ -185,7 +197,7 @@ def world(args, java: str, lib: Path, jar: Path, cp: list[Path], out: Path) -> t
         facts.mkdir(exist_ok=True)
         shutil.copyfile(args.horizon_resources / "facts.json", facts / "facts.json")
 
-    def run(slug: str, mode: str, edits: int, start_from: str | None) -> list[str] | str:
+    def run(slug: str, mode: str, edits: int, start_from: str | None, extra: tuple = ()) -> list[str] | str:
         run_dir = out / f"world-{slug}"
         shutil.rmtree(run_dir, ignore_errors=True)
         run_dir.mkdir(parents=True)
@@ -194,7 +206,7 @@ def world(args, java: str, lib: Path, jar: Path, cp: list[Path], out: Path) -> t
         result = out / f"world-{slug}.tsv"
         result.unlink(missing_ok=True)
         props = [f"-Dhz.mode={mode}", "-Dhz.world=normal", f"-Dhz.out={result}", f"-Dhz.radius={args.radius}",
-                 f"-Dhz.edits={edits}"]
+                 f"-Dhz.edits={edits}", *extra]
         if start_from:
             props.append("-Dhz.keep=true")
         if facts and mode == "rust":
@@ -208,6 +220,8 @@ def world(args, java: str, lib: Path, jar: Path, cp: list[Path], out: Path) -> t
             return f"the {slug} run failed (exit {code}); see {out / f'world-{slug}.log'}"
         return read(result)
 
+    if args.light:
+        return run
     report = ["## World probe", ""]
     plan = [("generated", "vanilla", 0, None),
             ("vanilla", "vanilla", 40_000, "generated"),
@@ -279,6 +293,44 @@ def world(args, java: str, lib: Path, jar: Path, cp: list[Path], out: Path) -> t
         report.append("")
     if not facts:
         report.append(f"- registry: not checked (no facts.json in {args.horizon_resources})")
+    return ok, report
+
+
+def light(args, java: str, lib: Path, jar: Path, cp: list[Path], out: Path) -> tuple[bool, list[str]]:
+    """P4: from one saved world, the probe's edits lit by vanilla's light engine (twice: the control) and by Rust's
+    propagation, both on Rust's memory (P2), compared chunk by chunk; and the time each spent propagating."""
+    run = world(args, java, lib, jar, cp, out)
+    report = ["## Light: vanilla's engine against Rust's propagation", ""]
+    plan = [("light-java", "rust", 40_000, "generated", ("-Dhz.light=time",)),
+            ("light-java-again", "rust", 40_000, "generated", ("-Dhz.light=time",)),
+            ("light-rust", "rust", 40_000, "generated", ("-Dhz.light=accel",))]
+    if not (args.reuse and (out / "world-generated" / "universe").exists()):
+        plan.insert(0, ("generated", "vanilla", 0, None, ()))
+    runs = {}
+    for slug, mode, edits, start_from, extra in plan:
+        before = out / f"world-{slug}.tsv"
+        if args.rust_only and slug != "light-rust" and before.exists():
+            runs[slug] = read(before)
+            continue
+        got = run(slug, mode, edits, start_from, extra)
+        if isinstance(got, str):
+            return False, report + [f"- {got}"]
+        runs[slug] = got
+    a, b, c = (chunk_fields(runs[k]) for k in ("light-java", "light-rust", "light-java-again"))
+    ok = len(a) == len(b) > 0 and set(a) == set(b)
+    report.append(f"- chunks: {len(a)} / {len(b)}")
+    for field in FIELDS:
+        differ = sum(1 for k in a if a[k].get(field) != b.get(k, {}).get(field))
+        control = sum(1 for k in a if a[k].get(field) != c.get(k, {}).get(field))
+        report.append(f"- {field}: {differ} chunks differ (vanilla against itself: {control})")
+        ok &= differ == 0 or (field == "saved" and differ <= control)
+    report.append("")
+    for slug in ("light-java", "light-java-again", "light-rust"):
+        for line in runs[slug]:
+            if line.startswith("light\t"):
+                report.append(f"- {slug}: {line.replace(chr(9), ', ')}")
+                if slug == "light-rust":
+                    ok &= "java runs 0" in line
     return ok, report
 
 

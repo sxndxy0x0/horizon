@@ -179,6 +179,9 @@ public final class World {
         List<String> out = new ArrayList<>();
         out.add("mode\t" + (rust ? "rust" : "vanilla"));
         out.add("world\t" + System.getProperty("hz.world") + "\tchunks " + chunks().size() + "\tedits " + EDITS);
+        if (Agent.LIGHT != null) {
+            out.add(RustLight.report());
+        }
         LevelLightEngine light = level.getChunkSource().getLightEngine();
         int minY = level.getMinY();
         int maxY = minY + level.getHeight();

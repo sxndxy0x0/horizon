@@ -181,6 +181,11 @@ public final class RustDataLayer extends DataLayer {
         return defaultValue;
     }
 
+    /** The address of the bytes, made now if the layer held only its default level (as a {@code set} would). */
+    long writable() {
+        return materialize().base;
+    }
+
     /** Keeps the bytes reachable while Rust reads them. */
     Object holder() {
         return bytes;

@@ -48,6 +48,15 @@ public final class Agent {
     /** Whether the game's storage and light go to Rust's memory: not in the vanilla run of the world probe. */
     static final boolean STORE = !"vanilla".equals(System.getProperty("hz.mode"));
     static final AtomicInteger REWRITTEN = new AtomicInteger();
+    /** P4 ({@link RustLight}): {@code hz.light} is {@code accel} (Rust propagates light) or {@code time}. */
+    static final String LIGHT = System.getProperty("hz.light");
+    static final String ENGINE = "net/minecraft/world/level/lighting/LightEngine";
+    static final String SECTION = "net/minecraft/world/level/chunk/LevelChunkSection";
+    static final String STATE_BASE = "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase";
+    /** The fields the agent adds: a section's light-class snapshot and its version, a state's light class. */
+    static final String SECTION_LIGHT = "hz$light";
+    static final String SECTION_VERSION = "hz$version";
+    static final String STATE_CLASS = "hz$lightClass";
     static final List<String> SITES = new ArrayList<>();
 
     private Agent() {}
@@ -59,6 +68,9 @@ public final class Agent {
                     byte[] bytes) {
                 if (name == null || !name.startsWith("net/minecraft/") || FACTORIES.containsKey(name)) {
                     return null;
+                }
+                if (LIGHT != null && java.util.Arrays.asList(LightNames.GUARDED).contains(name)) {
+                    LightNames.VANILLA_BYTES.put(name, sameAsJar(domain, name, bytes));
                 }
                 try {
                     return rewrite(bytes);
@@ -162,6 +174,97 @@ public final class Agent {
         return false;
     }
 
+    /**
+     * Whether a class is defined with the bytes its jar holds: no loader, mixin or agent before this one changed
+     * it. P4 runs light in Rust only when every light class is vanilla's own ({@link RustLight#rustRuns}).
+     */
+    static boolean sameAsJar(ProtectionDomain domain, String name, byte[] bytes) {
+        try {
+            java.net.URL where = domain == null || domain.getCodeSource() == null ? null
+                    : domain.getCodeSource().getLocation();
+            if (where == null) {
+                return false;
+            }
+            try (java.util.jar.JarFile jar = new java.util.jar.JarFile(new java.io.File(where.toURI()))) {
+                java.util.jar.JarEntry entry = jar.getJarEntry(name + ".class");
+                return entry != null && java.util.Arrays.equals(jar.getInputStream(entry).readAllBytes(), bytes);
+            }
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * P4: in {@code LightEngine.runLightUpdates}, {@code propagateDecreases()} becomes {@code RustLight.propagate(this)}
+     * and {@code propagateIncreases()} {@code RustLight.zero(this)}.
+     */
+    static boolean hookEngine(ClassNode node) {
+        boolean changed = false;
+        for (MethodNode m : node.methods) {
+            if (!m.name.equals("runLightUpdates") || !m.desc.equals("()I")) {
+                continue;
+            }
+            for (AbstractInsnNode insn : m.instructions.toArray()) {
+                if (insn instanceof MethodInsnNode c && c.owner.equals(ENGINE) && c.desc.equals("()I")
+                        && (c.name.equals("propagateDecreases") || c.name.equals("propagateIncreases"))) {
+                    m.instructions.set(c, new MethodInsnNode(Opcodes.INVOKESTATIC, "dev/horizonlab/shm/RustLight",
+                            c.name.equals("propagateDecreases") ? "propagate" : "zero", "(L" + ENGINE + ";)I", false));
+                    changed = true;
+                }
+            }
+        }
+        return changed;
+    }
+
+    /**
+     * P4: {@code LevelChunkSection} gets its light-class snapshot's address and version ({@link RustLight#snapshot});
+     * with {@code hz.light=accel}, {@code setBlockState} and {@code read} tell {@link RustLight} what changed before
+     * they return.
+     */
+    static boolean hookSection(ClassNode node) {
+        node.fields.add(new org.objectweb.asm.tree.FieldNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_VOLATILE, SECTION_LIGHT,
+                "J", null, null));
+        node.fields.add(new org.objectweb.asm.tree.FieldNode(Opcodes.ACC_PUBLIC | Opcodes.ACC_VOLATILE,
+                SECTION_VERSION, "I", null, null));
+        if (!"accel".equals(LIGHT)) {
+            return true;
+        }
+        String state = "Lnet/minecraft/world/level/block/state/BlockState;";
+        for (MethodNode m : node.methods) {
+            boolean set = m.name.equals("setBlockState") && m.desc.equals("(III" + state + "Z)" + state);
+            boolean read = m.name.equals("read") && m.desc.equals("(Lnet/minecraft/network/FriendlyByteBuf;)V");
+            if (!set && !read) {
+                continue;
+            }
+            for (AbstractInsnNode insn : m.instructions.toArray()) {
+                if (insn.getOpcode() != Opcodes.ARETURN && insn.getOpcode() != Opcodes.RETURN) {
+                    continue;
+                }
+                InsnList call = new InsnList();
+                call.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                if (set) {
+                    call.add(new VarInsnNode(Opcodes.ILOAD, 1));
+                    call.add(new VarInsnNode(Opcodes.ILOAD, 2));
+                    call.add(new VarInsnNode(Opcodes.ILOAD, 3));
+                    call.add(new VarInsnNode(Opcodes.ALOAD, 4));
+                    call.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "dev/horizonlab/shm/RustLight", "blockSet",
+                            "(L" + SECTION + ";III" + state + ")V", false));
+                } else {
+                    call.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "dev/horizonlab/shm/RustLight", "sectionRead",
+                            "(L" + SECTION + ";)V", false));
+                }
+                m.instructions.insertBefore(insn, call);
+            }
+        }
+        return true;
+    }
+
+    /** P4: {@code BlockStateBase} gets the field its light class is kept in ({@link RustLight#classOf}). */
+    static boolean hookState(ClassNode node) {
+        node.fields.add(new org.objectweb.asm.tree.FieldNode(Opcodes.ACC_PUBLIC, STATE_CLASS, "I", null, null));
+        return true;
+    }
+
     /** A method reference to a vanilla constructor ({@code DataLayer::new}), as a reference to its factory. */
     static Handle factoryHandle(Handle h) {
         String factory = FACTORIES.get(h.getOwner());
@@ -187,13 +290,23 @@ public final class Agent {
         ClassReader reader = new ClassReader(bytes);
         String text = new String(bytes, java.nio.charset.StandardCharsets.ISO_8859_1);
         boolean testServer = reader.getClassName().equals(TEST_SERVER) && System.getProperty("hz.world") != null;
+        String className = reader.getClassName();
+        boolean light = LIGHT != null && STORE
+                && (className.equals(ENGINE) || className.equals(SECTION) || className.equals(STATE_BASE));
         if (!text.contains(STORAGE) && !text.contains(LAYER) && !text.contains("getRaw") && !testServer
-                && !reader.getClassName().equals(TEST_MAIN)) {
+                && !reader.getClassName().equals(TEST_MAIN) && !light) {
             return null;
         }
         ClassNode node = new ClassNode();
         reader.accept(node, 0);
         boolean changed = testServer && hookWorld(node);
+        if (light) {
+            changed |= switch (className) {
+                case ENGINE -> hookEngine(node);
+                case SECTION -> hookSection(node);
+                default -> hookState(node);
+            };
+        }
         if (reader.getClassName().equals(TEST_MAIN) && Boolean.getBoolean("hz.keep")) {
             changed |= keepWorld(node);
         }

@@ -13,6 +13,7 @@
 //! Driven by `tools/shared_memory_probe.py`. Nothing here is linked into the game.
 
 pub mod level;
+pub mod light;
 
 use horizon_core::paletted::{PalettedContainer, Strategy};
 use horizon_core::position::BlockPos;
@@ -355,6 +356,109 @@ pub unsafe extern "C" fn hz_registry_check(
         }
     }
     wrong + (seen - registry.len() as i64).abs()
+}
+
+/// Registers light class `id` (see [`light::Class`]): `faces` points at 6 face ids, by `Direction` ordinal.
+///
+/// # Safety
+/// `faces` points at 6 `u32`s.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hz_light_class(
+    id: u32,
+    emission: u32,
+    dampening: u32,
+    empty_shape: u32,
+    faces: *const u32,
+) {
+    // SAFETY: as the caller promises.
+    let f = unsafe { slice::from_raw_parts(faces, 6) };
+    light::register(
+        id,
+        light::Class {
+            emission: emission.min(15) as u8,
+            dampening: dampening.min(15) as u8,
+            empty_shape: empty_shape != 0,
+            faces: [f[0], f[1], f[2], f[3], f[4], f[5]],
+        },
+    );
+}
+
+/// One `runLightUpdates`' propagation (see [`light`]): the decrease and increase queues as Java held them (pairs of
+/// longs: node, entry), sky or block light, `SkyDataLayerStorageMap.currentLowestY`, Java's air and bedrock classes.
+/// Returns the entries dequeued; `affected` gets a list of the sections written in and around (`*affected_len`
+/// longs, freed with [`hz_light_free`]).
+///
+/// # Safety
+/// `calls` points at live upcalls; `decrease`/`increase` at `*_len` longs; `affected` and `affected_len` are
+/// writable.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hz_light_run(
+    calls: *const light::Callbacks,
+    sky: u32,
+    lowest_y: i32,
+    air: u32,
+    bedrock: u32,
+    decrease: *const i64,
+    decrease_len: u32,
+    increase: *const i64,
+    increase_len: u32,
+    affected: *mut *mut i64,
+    affected_len: *mut u32,
+) -> i32 {
+    // SAFETY: as the caller promises.
+    let (calls, dec, inc) = unsafe {
+        (
+            &*calls,
+            longs(decrease, decrease_len).to_vec(),
+            longs(increase, increase_len).to_vec(),
+        )
+    };
+    let start = std::time::Instant::now();
+    let mut run = light::Run::new(sky != 0, lowest_y, air, bedrock, calls, dec, inc);
+    let count = run.propagate();
+    LIGHT_NANOS.fetch_add(
+        start.elapsed().as_nanos() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let list: Box<[i64]> = run.affected().into();
+    // SAFETY: as the caller promises.
+    unsafe {
+        *affected_len = list.len() as u32;
+        *affected = Box::into_raw(list).cast::<i64>();
+    }
+    count
+}
+
+/// Time spent in [`hz_light_run`] (upcalls into Java included), for the probe's report.
+static LIGHT_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Nanoseconds spent in [`hz_light_run`] so far.
+#[unsafe(no_mangle)]
+pub extern "C" fn hz_light_nanos() -> i64 {
+    LIGHT_NANOS.load(std::sync::atomic::Ordering::Relaxed) as i64
+}
+
+/// Frees a list from [`hz_light_run`].
+///
+/// # Safety
+/// `ptr` and `len` are what one `hz_light_run` handed out, not freed before.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn hz_light_free(ptr: *mut i64, len: u32) {
+    if !ptr.is_null() {
+        // SAFETY: as the caller promises.
+        drop(unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(ptr, len as usize)) });
+    }
+}
+
+/// # Safety
+/// `ptr` points at `len` longs, or `len` is 0.
+unsafe fn longs<'a>(ptr: *const i64, len: u32) -> &'a [i64] {
+    if len == 0 {
+        &[]
+    } else {
+        // SAFETY: as the caller promises.
+        unsafe { slice::from_raw_parts(ptr, len as usize) }
+    }
 }
 
 #[cfg(test)]
