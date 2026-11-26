@@ -42,7 +42,33 @@ public final class Agent {
 
     private Agent() {}
 
+    /** The Minecraft the light port and the backend are made for. */
+    static final String MINECRAFT = "26.3";
+
+    /**
+     * The game's version, from {@code version.json} in its jar on the class path (vanilla and Fabric), or null
+     * where the class path has no game jar (NeoForge and Forge load it themselves; the launcher checks for those).
+     */
+    static String minecraft() {
+        try (java.io.InputStream in = ClassLoader.getSystemResourceAsStream("version.json")) {
+            if (in == null) {
+                return null;
+            }
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile("\"id\"\\s*:\\s*\"([^\"]+)\"")
+                    .matcher(new String(in.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8));
+            return m.find() ? m.group(1) : null;
+        } catch (IOException e) {
+            return null;
+        }
+    }
+
     public static void premain(String args, Instrumentation inst) {
+        String minecraft = minecraft();
+        if (minecraft != null && !minecraft.equals(MINECRAFT)) {
+            // A launcher that gives every version the same JVM arguments: the others play as they are.
+            System.out.println("[horizon-accel] off: Minecraft " + minecraft + ", made for " + MINECRAFT);
+            return;
+        }
         Set<String> on = new HashSet<>(Arrays.asList(System.getProperty("horizon.accel", "").split(",")));
         File home = home();
         if (on.contains("light")) {
