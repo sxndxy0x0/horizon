@@ -46,6 +46,27 @@ public final class Rewrites {
     public static final String ENGINE = "net/minecraft/world/level/lighting/LightEngine";
     public static final String SECTION = "net/minecraft/world/level/chunk/LevelChunkSection";
     public static final String STATE_BASE = "net/minecraft/world/level/block/state/BlockBehaviour$BlockStateBase";
+    /** P6: the generator whose {@code buildTerrain} Rust may do, and the class that decides. */
+    public static final String NOISE_GEN = "net/minecraft/world/level/levelgen/NoiseBasedChunkGenerator";
+    public static final String RUST_GEN = RUNTIME + "RustGen";
+    static final String BUILD_TERRAIN = "(Lnet/minecraft/world/level/chunk/ChunkAccess;Lnet/minecraft/world/level/levelgen/blending/Blender;Lnet/minecraft/world/level/levelgen/RandomState;Lnet/minecraft/world/level/StructureManager;Lnet/minecraft/world/level/biome/BiomeManager;Lnet/minecraft/server/level/WorldGenRegion;Ljava/util/Set;)Ljava/util/concurrent/CompletableFuture;";
+    /**
+     * What the terrain runs, by class or {@code class.method+descriptor} ({@code RustGen.GUARDED}, which cannot see
+     * this class under Knot): Rust makes terrain only while each is the jar's own.
+     */
+    public static final String[] GEN_GUARDED = {
+        NOISE_GEN + ".buildTerrain" + BUILD_TERRAIN,
+        NOISE_GEN + ".lambda$buildTerrain$0(Lnet/minecraft/world/level/chunk/ChunkAccess;Lnet/minecraft/world/level/StructureManager;Lnet/minecraft/world/level/levelgen/blending/Blender;Lnet/minecraft/world/level/levelgen/RandomState;Lnet/minecraft/world/level/levelgen/NoiseSettings;Lnet/minecraft/world/level/biome/BiomeManager;Ljava/util/Set;Lnet/minecraft/server/level/WorldGenRegion;)Lnet/minecraft/world/level/chunk/ChunkAccess;",
+        NOISE_GEN + ".doFill(Lnet/minecraft/world/level/levelgen/NoiseChunk;Lnet/minecraft/world/level/chunk/ChunkAccess;)V",
+        "net/minecraft/world/level/levelgen/NoiseChunk",
+        "net/minecraft/world/level/levelgen/Aquifer$NoiseBasedAquifer",
+        "net/minecraft/world/level/levelgen/material/MaterialSystem",
+        "net/minecraft/world/level/levelgen/Beardifier",
+        "net/minecraft/world/level/levelgen/RandomState!createClimateSampler",
+        "net/minecraft/world/level/levelgen/carver/WorldCarver",
+        "net/minecraft/world/level/levelgen/carver/CaveWorldCarver",
+        "net/minecraft/world/level/levelgen/carver/CanyonWorldCarver",
+    };
     /** The fields added: a section's light-class snapshot and its version, a state's light class. */
     public static final String SECTION_LIGHT = "hz$light";
     public static final String SECTION_VERSION = "hz$version";
@@ -61,6 +82,12 @@ public final class Rewrites {
         return !"vanilla".equals(System.getProperty("hz.mode"));
     }
 
+    /** {@code hz.gen}: {@code rust} (Rust makes terrain where it is the game's) or {@code check}, else none. */
+    public static boolean gen() {
+        String g = System.getProperty("hz.gen");
+        return g != null && !g.isEmpty();
+    }
+
     /** {@code hz.light}: {@code accel} (Rust propagates light), {@code time} (vanilla's, timed), or none. */
     public static String light() {
         return System.getProperty("hz.light");
@@ -71,10 +98,34 @@ public final class Rewrites {
         if (memory() && name.equals(STORAGE)) {
             guardStorage(loader, domain, bytes);
         }
+        if (gen()) {
+            guardList(GEN_GUARDED, loader, domain, name, bytes);
+        }
         if (light() == null) {
             return;
         }
-        for (String g : LightNames.GUARDED) {
+        guardList(LightNames.GUARDED, loader, domain, name, bytes);
+    }
+
+    /** Records each entry of {@code list} that names this class, or a method of it: the jar's own or not. */
+    static void guardList(String[] list, ClassLoader loader, ProtectionDomain domain, String name, byte[] bytes) {
+        for (String g : list) {
+            if (g.startsWith(name + "!")) {
+                // The class but the methods named after "!": each other method of the jar's must run as there.
+                // What a mixin adds that those methods do not call cannot change them.
+                java.util.Set<String> skip = java.util.Set.of(g.substring(name.length() + 1).split(","));
+                byte[] jar = jarBytes(loader, domain, name);
+                boolean same = jar != null;
+                if (same) {
+                    for (MethodNode m : node(jar).methods) {
+                        if (!skip.contains(m.name) && !code(bytes, m.name + m.desc).equals(code(jar, m.name + m.desc))) {
+                            same = false;
+                        }
+                    }
+                }
+                LightNames.VANILLA_BYTES.put(g, same);
+                continue;
+            }
             if (g.equals(name)) {
                 byte[] jar = jarBytes(loader, domain, name);
                 LightNames.VANILLA_BYTES.put(name, jar != null && Arrays.equals(jar, bytes));
@@ -201,6 +252,9 @@ public final class Rewrites {
 
     /** Whether {@link #apply} may change a class with these bytes: a cheap look before it is parsed. */
     public static boolean wanted(String className, byte[] bytes) {
+        if (gen() && className.equals(NOISE_GEN)) {
+            return true;
+        }
         if (light() != null && memory()
                 && (className.equals(ENGINE) || className.equals(SECTION) || className.equals(STATE_BASE))) {
             return true;
@@ -215,6 +269,9 @@ public final class Rewrites {
     /** Every edit this class needs; whether any was made. */
     public static boolean apply(ClassNode node) {
         boolean changed = false;
+        if (gen() && node.name.equals(NOISE_GEN)) {
+            changed |= hookGen(node);
+        }
         if (light() != null && memory()) {
             changed |= switch (node.name) {
                 case ENGINE -> hookEngine(node);
@@ -347,6 +404,35 @@ public final class Rewrites {
      * In {@code LightEngine.runLightUpdates}, {@code propagateDecreases()} becomes {@code RustLight.propagate(this)}
      * and {@code propagateIncreases()} {@code RustLight.zero(this)}.
      */
+    /**
+     * P6: the game's {@code buildTerrain} becomes {@code hz$javaBuildTerrain} (public, as it was), and a new
+     * {@code buildTerrain} passes its arguments to {@code RustGen.buildTerrain(this, ...)}, which calls the game's
+     * own whenever the chunk is not Rust's to make. No branch in the new method, so no stack frame to write.
+     */
+    static boolean hookGen(ClassNode node) {
+        MethodNode game = null;
+        for (MethodNode m : node.methods) {
+            if (m.name.equals("buildTerrain") && m.desc.equals(BUILD_TERRAIN)) {
+                game = m;
+            }
+        }
+        if (game == null) {
+            return false;
+        }
+        game.name = "hz$javaBuildTerrain";
+        MethodNode m = new MethodNode(Opcodes.ACC_PUBLIC, "buildTerrain", BUILD_TERRAIN, game.signature,
+                game.exceptions == null ? null : game.exceptions.toArray(new String[0]));
+        m.instructions.add(new VarInsnNode(Opcodes.ALOAD, 0));
+        for (int i = 1; i <= 7; i++) {
+            m.instructions.add(new VarInsnNode(Opcodes.ALOAD, i));
+        }
+        m.instructions.add(new MethodInsnNode(Opcodes.INVOKESTATIC, RUST_GEN, "buildTerrain",
+                "(L" + NOISE_GEN + ";" + BUILD_TERRAIN.substring(1), false));
+        m.instructions.add(new org.objectweb.asm.tree.InsnNode(Opcodes.ARETURN));
+        node.methods.add(m);
+        return true;
+    }
+
     static boolean hookEngine(ClassNode node) {
         boolean changed = false;
         for (MethodNode m : node.methods) {

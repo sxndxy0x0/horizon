@@ -127,7 +127,19 @@ def build(minecraft: Path, version: str, java_home: Path | None, out: Path) -> P
     return jar
 
 
-OPTIONS = "onboardAccessibility:false\nskipMultiplayerWarning:true\njoinedFirstServer:true\ntutorialStep:none\n"
+# No VSync and no frame cap (the FPS --fps measures is the game's own), no pause when the window loses focus, no
+# sound; the distances of a common player setup.
+OPTIONS = """onboardAccessibility:false
+skipMultiplayerWarning:true
+joinedFirstServer:true
+tutorialStep:none
+enableVsync:false
+maxFps:260
+pauseOnLostFocus:false
+soundCategory_master:0.0
+renderDistance:10
+simulationDistance:5
+"""
 
 # What a run waits for in the log, by name.
 MARKERS = {
@@ -181,7 +193,10 @@ def run(args) -> int:
     # As the version file asks (its jvm arguments, which a launcher passes): a stack shadow zone native code fits.
     cmd = [java, "-Xmx3g", "-Xss1M", "-XX:StackShadowPages=32", "--enable-native-access=ALL-UNNAMED",
            f"-Djava.library.path={natives}",
-           f"-javaagent:{jar}", f"-Dhorizon.accel={args.accel}", *os.environ.get("HZ_JVM_EXTRA", "").split(),
+           f"-javaagent:{jar}", f"-Dhorizon.accel={args.accel}",
+           *([f"-Dhorizon.accel.gen={args.gen}",
+              f"-Dhorizon.accel.gen.resources={ROOT / '.local' / 'horizon-client' / '26.3'}"] if "gen" in args.accel else []),
+           *os.environ.get("HZ_JVM_EXTRA", "").split(),
            f"-Dfabric.gameJarPath={game_jar}", *loader_probe.profile_args(profile_json, versions, libraries, "jvm"),
            "-cp", os.pathsep.join(map(str, [*libs, game_jar])), main_class,
            *loader_probe.profile_args(profile_json, versions, libraries, "game"),
@@ -193,11 +208,15 @@ def run(args) -> int:
     want = [m for m in MARKERS if m != "light on the client" or "light" in args.accel]
     if "light" not in args.accel:
         want = [m for m in want if not m.startswith("light")]
+    if "light" not in args.accel and "wgpu" not in args.accel:
+        want = [m for m in want if m != "runtime injected"]
     print(f"[accel] {args.profile}: {len(libs)} libraries, main {main_class}, log {log_path}")
     with open(log_path, "w", encoding="utf-8") as log:
         proc = subprocess.Popen(cmd, cwd=game_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                                 encoding="utf-8", errors="replace")
         backend = []
+        fps: list[int] = []
+        ready_at: list[float] = []
 
         def read() -> None:
             assert proc.stdout
@@ -210,6 +229,10 @@ def run(args) -> int:
                     backend.append(line.strip())
                 if FALLBACK in line and "fallback" not in seen:
                     seen["fallback"] = line.strip()
+                if MARKERS["world joined"] in line and not ready_at:
+                    ready_at.append(time.time())
+                if "[horizon-accel] fps " in line and ready_at and time.time() - ready_at[0] > 10:
+                    fps.append(int(line.rsplit(" ", 1)[1]))
         reader = threading.Thread(target=read, daemon=True)
         reader.start()
         start = time.time()
@@ -224,7 +247,8 @@ def run(args) -> int:
             if args.shot and ready is not None and time.time() - ready > 15:
                 print(f"- screenshot: {capture(proc.pid, args.shot.resolve())}")
                 args.shot = None
-            if done() and time.time() - start > args.settle and not args.shot:
+            measured = not args.measure or (ready_at and time.time() - ready_at[0] > args.measure)
+            if done() and time.time() - start > args.settle and not args.shot and measured:
                 break
             time.sleep(1)
         exited = proc.poll()
@@ -233,6 +257,9 @@ def run(args) -> int:
         proc.wait()
         reader.join(timeout=10)
     print(f"- graphics: {backend[0] if backend else 'not seen'}")
+    if fps:
+        low = sorted(fps)[max(0, len(fps) // 20 - 1)]
+        print(f"- fps: mean {sum(fps) / len(fps):.0f}, low 5% {low}, min {min(fps)} over {len(fps)} s in the world")
     if "fallback" in seen:
         print(f"- {seen['fallback'][-300:]}")
     for name in want:
@@ -277,6 +304,9 @@ def main() -> int:
                    help="the player's launcher folder, for libraries and assets a --minecraft folder lacks (read only)")
     r.add_argument("--mods", type=Path, nargs="*", default=[], help="mod jars to play with (copied)")
     r.add_argument("--timeout", type=int, default=600, help="seconds to wait for the markers")
+    r.add_argument("--gen", default="rust", choices=["rust", "check"],
+                   help="with gen in --accel: Rust makes terrain, or both make it and it is compared")
+    r.add_argument("--measure", type=int, default=0, help="seconds to keep playing after joining the world")
     r.add_argument("--shot", type=Path, help="a PNG of the game's window, 15 seconds into the world (Windows)")
     r.add_argument("--settle", type=int, default=20, help="seconds to keep playing at least")
     args = ap.parse_args()

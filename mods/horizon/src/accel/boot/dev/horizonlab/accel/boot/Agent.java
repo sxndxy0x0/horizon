@@ -78,6 +78,15 @@ public final class Agent {
         } else {
             System.setProperty("hz.mode", "vanilla");
         }
+        if (on.contains("gen")) {
+            // P6: terrain in Rust (or, with horizon.accel.gen=check, made by both and compared), from the resources
+            // horizon-prepare made from the player's own game.
+            System.setProperty("hz.gen", System.getProperty("horizon.accel.gen", "rust"));
+            System.setProperty("hz.gen.resources", System.getProperty("horizon.accel.gen.resources",
+                    new File(home, "resources").getAbsolutePath()));
+            setIfAbsent("hz.lib", System.getProperty("horizon.accel.lib", library(home, "horizon_shm_probe")));
+            preloadGen();
+        }
         wgpu = on.contains("wgpu");
         if (wgpu) {
             setIfAbsent("hz.wgpu.lib", System.getProperty("horizon.accel.wgpu.lib", library(home, "horizon_wgpu_backend")));
@@ -103,6 +112,9 @@ public final class Agent {
                 if (name == null || loader == null || !name.startsWith("net/minecraft/")) {
                     return null;
                 }
+                if (name.equals("net/minecraft/client/Minecraft")) {
+                    game = loader;
+                }
                 try {
                     Rewrites.guard(loader, domain, name, bytes);
                     boolean backends = wgpu && name.equals(BACKENDS);
@@ -120,6 +132,74 @@ public final class Agent {
                 }
             }
         });
+        long every = Long.getLong("horizon.accel.fps", 0L);
+        if (every > 0) {
+            sampleFps(every);
+        }
+    }
+
+    /**
+     * Rust reads the worldgen data (block states, noises, density functions, ...) while the game starts, on a thread
+     * of its own: the first world then finds it loaded, and its loading screen does not wait for it. The same library
+     * {@code RustGen} later opens: the process loads it once.
+     */
+    static void preloadGen() {
+        Thread t = new Thread(() -> {
+            long start = System.nanoTime();
+            try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
+                var lib = java.lang.foreign.SymbolLookup.libraryLookup(
+                        java.nio.file.Path.of(System.getProperty("hz.lib")), java.lang.foreign.Arena.global());
+                var preload = java.lang.foreign.Linker.nativeLinker().downcallHandle(
+                        lib.find("hz_gen_preload").orElseThrow(),
+                        java.lang.foreign.FunctionDescriptor.of(java.lang.foreign.ValueLayout.JAVA_INT,
+                                java.lang.foreign.ValueLayout.ADDRESS, java.lang.foreign.ValueLayout.JAVA_LONG));
+                var path = arena.allocateFrom(System.getProperty("hz.gen.resources"),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                int r = (int) preload.invokeExact(path, path.byteSize() - 1);
+                System.out.println("[horizon-gen] worldgen data " + (r == 0 ? "loaded" : "could not load") + " in "
+                        + (System.nanoTime() - start) / 1_000_000 + " ms");
+            } catch (Throwable e) {
+                System.out.println("[horizon-gen] worldgen data not preloaded: " + e);
+            }
+        }, "horizon-gen-preload");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /** The loader that defines {@code Minecraft}, for {@link #sampleFps}. */
+    static volatile ClassLoader game;
+
+    /**
+     * For measuring ({@code -Dhorizon.accel.fps=MILLIS}, tools/java_accel.py --fps): the game's own frames per
+     * second, {@code Minecraft.getFps()}, printed every so often. By reflection: these classes reference no game class.
+     */
+    static void sampleFps(long every) {
+        Thread t = new Thread(() -> {
+            try {
+                Method instance = null;
+                Method fps = null;
+                while (true) {
+                    Thread.sleep(every);
+                    ClassLoader l = game;
+                    if (l == null) {
+                        continue;
+                    }
+                    if (fps == null) {
+                        Class<?> mc = Class.forName("net.minecraft.client.Minecraft", false, l);
+                        instance = mc.getMethod("getInstance");
+                        fps = mc.getMethod("getFps");
+                    }
+                    Object m = instance.invoke(null);
+                    if (m != null) {
+                        System.out.println("[horizon-accel] fps " + fps.invoke(m));
+                    }
+                }
+            } catch (InterruptedException | ReflectiveOperationException | LinkageError e) {
+                System.out.println("[horizon-accel] fps: " + e);
+            }
+        }, "horizon-fps");
+        t.setDaemon(true);
+        t.start();
     }
 
     /**

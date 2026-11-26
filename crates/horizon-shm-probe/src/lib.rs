@@ -14,6 +14,7 @@
 
 pub mod level;
 pub mod light;
+pub mod worldgen;
 
 use horizon_core::paletted::{PalettedContainer, Strategy};
 use horizon_core::position::BlockPos;

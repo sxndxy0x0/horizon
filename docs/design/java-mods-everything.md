@@ -574,6 +574,42 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
 - **ยังไม่ได้เทียบภาพหรือแสงแบบทีละ pixel/chunk ใต้ loader:** การทดสอบตอนนี้ดูว่าเร่งจริงและเล่นได้ ส่วนความตรงพิสูจน์ใน P3/P4 บน class path ธรรมดา
 - **ชื่อของไลบรารี native ยังเป็นของตัวทดลอง (`horizon_shm_probe`):** ควรแยก crate ของจริงออกมา
 
+## P6 (2026-11-26): สร้างภูมิประเทศด้วย Rust ในเกม Java ตัวจริง
+
+เป้าหมาย: โหลดโลกและบินไปที่ใหม่เร็วขึ้น โดยได้โลกเหมือน vanilla ทุกบล็อก ใช้ตัวสร้างโลก Rust ที่ Horizon มีอยู่แล้ว (`crates/horizon-world`, ผ่าน harness เทียบกับ vanilla ทั้ง chunk)
+
+### วิธีทำ
+
+- **ขั้นที่ย้าย:** `NoiseBasedChunkGenerator.buildTerrain` ของ 26.3 (noise และ aquifer, ผิวดิน, ถ้ำ) ทั้งก้อน ตรงกับ `GeneratorWorker::generate_proto` ของ Rust ที่ไม่ต้องรู้สถานะ chunk ข้างๆ
+- **agent (`Rewrites.hookGen`):** เปลี่ยนชื่อเมธอดของเกมเป็น `hz$javaBuildTerrain` แล้วให้ `buildTerrain` ใหม่ส่งต่อให้ `RustGen.buildTerrain` ซึ่งเรียกของเกมผ่าน `MethodHandle` เมื่อ chunk นั้นไม่ใช่งานของ Rust (เมธอดใหม่ไม่มี branch จึงไม่ต้องเขียน stack frame)
+- **Rust (`crates/horizon-shm-probe/src/worldgen.rs`):** worker หนึ่งตัวต่อ thread ตอบ state id ของทุกบล็อก (เลข id ของ vanilla: `facts.json` เรียงตาม id และ Java ตรวจชื่อทุก state กับ registry ของตัวเองก่อน), ตำแหน่ง postprocessing ของของเหลว และ biome ทุก quart
+- **Java เขียนผลลง `ProtoChunk`:** ใส่บล็อก, postprocessing แล้ว prime heightmap `OCEAN_FLOOR_WG`/`WORLD_SURFACE_WG` จากบล็อก (check mode พิสูจน์ว่าได้เท่ากับที่การ fill ของเกมทิ้งไว้)
+- **ข้อมูลของ Rust:** ไดเรกทอรีที่ `horizon-prepare` ทำจาก jar ของผู้เล่น (`facts.json` และ `worldgen/`) โหลดบน thread แยกตั้งแต่ premain ระหว่างที่ผู้เล่นยังอยู่ในเมนู
+
+### ตอนไหนเป็นของ Java (กันพลาด)
+
+- **ทั้ง level:** generator ไม่ใช่คลาส vanilla เอง, settings หรือ biome source ไม่ใช่ของ vanilla สำหรับมิตินั้น, ความสูงไม่ตรง, คลาสที่สร้างภูมิประเทศถูก loader หรือม็อดแก้ (`RustGen.GUARDED`; `RandomState` ตรวจทุกเมธอดยกเว้น `createClimateSampler` ที่ Fabric API ใช้เก็บ seed), หรือ registry ที่ภูมิประเทศอ่านมีของต่างจาก jar
+  - registry: `noise_settings`, `density_function`, `noise`, `carver`, `material_rule`, `material_condition`, `multi_noise_biome_source_parameter_list` และ `biome` (เฉพาะ carvers กับ climate) ทุก entry ของ vanilla decode จาก JSON ใน jar แล้ว encode ด้วย codec ของเกมเอง เทียบกับของจริง (ไม่เทียบ feature และ mob ของ biome เพราะ Fabric API เติมได้โดยไม่กระทบภูมิประเทศ)
+- **ทีละ chunk:** มีการ blend กับ chunk เก่า, chunk ที่ upgrade (below zero retrogen), มีโครงสร้างที่ปรับภูมิประเทศใกล้ๆ (`Beardifier` ไม่ว่าง; Rust จึงรันแบบไม่มีโครงสร้าง) หรือ biome ที่เกมวางไว้ไม่ตรงกับของ Rust ทุก quart (ครอบคลุมม็อดที่แก้การวาง biome)
+- **ยังไม่ครอบคลุม:** tag ของบล็อก (เช่น `#overworld_carver_replaceables`) ที่ data pack แก้
+
+### ผล (`tools/java_accel.py run --accel gen --gen check|rust`, โลกใหม่ที่มีแค่ `level.dat` และ `data/`)
+
+| ชุด | chunk ที่เทียบ | ต่าง (บล็อก, postprocessing, heightmap) |
+|---|---|---|
+| vanilla 26.3 | 1001 + 801 | 0 |
+| Fabric 26.3 + ม็อด 21 ตัวของผู้เล่น (ไม่มี C2ME) + แสง Rust | 802 | 0 |
+
+- **ความเร็ว (ทีละ chunk, thread เดียว, harness):** Rust 24 ms เทียบ vanilla 68 ms ในเกมจริง Rust 27-37 ms ต่อ chunk
+- **เวลาเตรียม:** ครั้งแรกใช้ 4.6 วินาที (โหลดข้อมูล 3.5) หลัง preload ตอน premain, ดึงชื่อ state ทีเดียว และ open generator คู่กับการตรวจ registry เหลือ 0.8-0.9 วินาที
+- **เข้าโลกใหม่:** จาก server เริ่มถึงเข้าโลก 8 วินาที เทียบ 9-10 ของ vanilla ส่วนที่เหลือคือ server เริ่ม, structure/biome/หาจุดเกิด (Java) และ feature, แสงของ 48 chunk แรก
+
+### ถัดไป
+
+- biome, structure start และการหาจุดเกิดใน Rust (มี port แล้ว)
+- feature (ต้นไม้ แร่) ใน Rust พร้อมกันพลาดสำหรับม็อดที่เติม feature
+- tag ของบล็อกใน registry guard
+
 ## เอาอะไรจาก forge/ari มาใช้
 
 host JNI (`horizon-java-host`), views, bridges, routes (`routes.rs`: Edge/Body), การ export facts และ cache เนื้อหา, harness ที่เทียบกับ loader จริง สิ่งที่เปลี่ยนคือฝั่งที่เป็นหลัก (Java) และจุดที่เข้าไปแทรก (agent แทน `ClassProcessor`)
