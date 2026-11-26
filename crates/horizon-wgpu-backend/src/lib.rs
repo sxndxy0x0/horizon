@@ -45,6 +45,12 @@ pub struct Ctx {
     encoder: Option<wgpu::CommandEncoder>,
     /// Whether the encoder holds commands not yet submitted.
     recorded: bool,
+    /// A submit the game asked for and that waits for the next (see [`hz_submit`]).
+    deferred: bool,
+    /// Where the render thread's time goes (`HZ_WGPU_PROFILE`).
+    prof: Option<Prof>,
+    /// The thread that hands the queue its work (see [`Sender`]).
+    sender: Sender,
     pass: Option<Pass>,
     /// Transient regions written since the last submit: (buffer, offset, bytes).
     dirty: Vec<(wgpu::Buffer, u64, Vec<u8>)>,
@@ -192,6 +198,10 @@ struct Pass {
     index_format: wgpu::IndexFormat,
     /// The index buffer the game bound, set again after a fan draw bound its own.
     index: Option<wgpu::Buffer>,
+    /// What each vertex slot and bind group has now: the game sets the same ones again draw after draw, and
+    /// wgpu replays and tracks every command it is given when the encoder finishes.
+    vertex: Vec<Option<(wgpu::Buffer, u64, u64)>>,
+    groups: Vec<Option<(wgpu::BindGroup, Vec<u32>)>>,
     /// Debugging: the first color target, for the pass dumps.
     first_color: Option<(wgpu::Texture, u32)>,
 }
@@ -199,16 +209,29 @@ struct Pass {
 pub struct Surface {
     /// None when headless (`HZ_WGPU_HEADLESS`): frames are drawn and submitted, not shown. For comparing backends
     /// whose window surface a driver does not offer (wgpu's Vulkan on some Windows drivers).
-    surface: Option<wgpu::Surface<'static>>,
+    surface: Option<Arc<wgpu::Surface<'static>>>,
     config: Option<wgpu::SurfaceConfiguration>,
-    current: Option<wgpu::SurfaceTexture>,
-    suboptimal: bool,
+    /// What the queue's thread last got acquiring a texture (see [`hz_surface_acquire`]), and whether it was
+    /// suboptimal.
+    status: Arc<std::sync::atomic::AtomicI32>,
+    suboptimal: Arc<std::sync::atomic::AtomicBool>,
+    /// The blit [`hz_surface_blit`] made ready, for the present.
+    blit: Option<Blit>,
+    /// The queue thread's done count, and the job that presents this surface's last texture: freeing the surface
+    /// waits for it.
+    presenting: Option<(Arc<AtomicU64>, u64)>,
 }
 
 fn guard<T>(ctx: *mut Ctx, fallback: T, f: impl FnOnce(&mut Ctx) -> Result<T, String>) -> T {
     // SAFETY: Java hands back the context `hz_create` made, on the one render thread.
     let ctx = unsafe { &mut *ctx };
-    match catch_unwind(AssertUnwindSafe(|| f(ctx))) {
+    let start = ctx.prof.is_some().then(std::time::Instant::now);
+    let r = catch_unwind(AssertUnwindSafe(|| f(ctx)));
+    if let (Some(start), Some(p)) = (start, ctx.prof.as_mut()) {
+        p.rust += start.elapsed();
+        p.calls += 1;
+    }
+    match r {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             eprintln!("[horizon-wgpu] {e}");
@@ -224,6 +247,273 @@ fn guard<T>(ctx: *mut Ctx, fallback: T, f: impl FnOnce(&mut Ctx) -> Result<T, St
             eprintln!("[horizon-wgpu] panic: {e}");
             ctx.error = e;
             fallback
+        }
+    }
+}
+
+/// Work for the queue, in the order the game made it.
+enum Job {
+    Write(wgpu::Buffer, u64, Vec<u8>),
+    /// Texture, mip, origin, bytes, bytes per row, extent.
+    WriteTexture(
+        wgpu::Texture,
+        u32,
+        wgpu::Origin3d,
+        Vec<u8>,
+        u32,
+        wgpu::Extent3d,
+    ),
+    /// The encoder to finish and submit, the serial the submit completes, and the screen to show it on.
+    Submit(Option<wgpu::CommandEncoder>, u64, Option<Show>),
+}
+
+/// The game's frame drawn into the screen's texture, flipped back to the screen's row order: made on the render
+/// thread, drawn by the queue's thread into the texture it acquires.
+struct Blit {
+    pipeline: wgpu::RenderPipeline,
+    bind: wgpu::BindGroup,
+    size: (u32, u32),
+}
+
+/// A frame for the screen (see [`hz_surface_acquire`]).
+struct Show {
+    surface: Arc<wgpu::Surface<'static>>,
+    blit: Blit,
+    status: Arc<std::sync::atomic::AtomicI32>,
+    suboptimal: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Hands the queue its work on a thread of its own. Finishing an encoder (where wgpu replays and checks every
+/// command), submitting and presenting cost about as much as the game's recording of the frame; that thread does
+/// them while the render thread records the next frame. Every queue operation goes through it, in order.
+/// `HZ_WGPU_SYNC` does them on the render thread instead.
+struct Sender {
+    queue: wgpu::Queue,
+    completed: Arc<AtomicU64>,
+    channel: Option<std::sync::mpsc::Sender<Job>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    /// Jobs sent, and done.
+    sent: u64,
+    done: Arc<AtomicU64>,
+    /// The job number of the last submit.
+    last_submit: u64,
+}
+
+impl Sender {
+    fn new(queue: wgpu::Queue, completed: Arc<AtomicU64>) -> Self {
+        let done = Arc::new(AtomicU64::new(0));
+        let mut channel = None;
+        let mut thread = None;
+        if env("HZ_WGPU_SYNC").is_none() {
+            let (tx, rx) = std::sync::mpsc::channel::<Job>();
+            let (q, c, d) = (queue.clone(), completed.clone(), done.clone());
+            if let Ok(t) = std::thread::Builder::new()
+                .name("horizon-wgpu queue".into())
+                .spawn(move || {
+                    for job in rx {
+                        if let Err(p) = catch_unwind(AssertUnwindSafe(|| run(&q, &c, job))) {
+                            eprintln!(
+                                "[horizon-wgpu] queue thread: {:?}",
+                                p.downcast_ref::<String>()
+                            );
+                        }
+                        d.fetch_add(1, Ordering::Release);
+                    }
+                })
+            {
+                channel = Some(tx);
+                thread = Some(t);
+            }
+        }
+        Self {
+            queue,
+            completed,
+            channel,
+            thread,
+            sent: 0,
+            done,
+            last_submit: 0,
+        }
+    }
+
+    fn send(&mut self, job: Job) {
+        self.sent += 1;
+        let job = match &self.channel {
+            Some(c) => match c.send(job) {
+                Ok(()) => return,
+                // The thread is gone: do it here.
+                Err(e) => e.0,
+            },
+            None => job,
+        };
+        run(&self.queue, &self.completed, job);
+        self.done.fetch_add(1, Ordering::Release);
+    }
+
+    /// Waits until `job` jobs are done.
+    fn reach(&self, job: u64) {
+        let mut spins = 0u32;
+        while self.done.load(Ordering::Acquire) < job {
+            spins += 1;
+            if spins < 64 {
+                std::hint::spin_loop();
+            } else {
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+impl Drop for Sender {
+    fn drop(&mut self) {
+        self.channel = None;
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Acquires the screen's texture and records the blit into it; the texture, to present after the submit.
+fn blit(show: Show, encoder: Option<&mut wgpu::CommandEncoder>) -> Option<wgpu::SurfaceTexture> {
+    let encoder = encoder?;
+    let (texture, suboptimal) = match show.surface.get_current_texture() {
+        wgpu::CurrentSurfaceTexture::Success(t) => (t, false),
+        wgpu::CurrentSurfaceTexture::Suboptimal(t) => (t, true),
+        other => {
+            let status = match other {
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => 0,
+                wgpu::CurrentSurfaceTexture::Outdated => -1,
+                _ => -2,
+            };
+            show.status.store(status, Ordering::Release);
+            return None;
+        }
+    };
+    show.suboptimal.store(suboptimal, Ordering::Release);
+    let target = texture.texture.create_view(&Default::default());
+    let (w, h) = (
+        show.blit.size.0.min(texture.texture.width()),
+        show.blit.size.1.min(texture.texture.height()),
+    );
+    let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some("horizon present"),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: &target,
+            depth_slice: None,
+            resolve_target: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        ..Default::default()
+    });
+    if w > 0 && h > 0 {
+        pass.set_pipeline(&show.blit.pipeline);
+        pass.set_bind_group(0, &show.blit.bind, &[]);
+        pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
+        pass.draw(0..3, 0..1);
+    }
+    drop(pass);
+    Some(texture)
+}
+
+/// Nanoseconds the queue's thread spent finishing, submitting and presenting (`HZ_WGPU_PROFILE`).
+static QUEUE_TIMES: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+
+fn run(queue: &wgpu::Queue, completed: &Arc<AtomicU64>, job: Job) {
+    match job {
+        Job::Write(buffer, offset, data) => queue.write_buffer(&buffer, offset, &data),
+        Job::WriteTexture(texture, mip, origin, data, row, extent) => queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: mip,
+                origin,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &data,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(row),
+                rows_per_image: Some(extent.height),
+            },
+            extent,
+        ),
+        Job::Submit(mut encoder, serial, show) => {
+            let t = std::time::Instant::now();
+            let texture = show.and_then(|show| blit(show, encoder.as_mut()));
+            let commands = encoder.map(|e| e.finish());
+            let t2 = std::time::Instant::now();
+            queue.submit(commands);
+            let t3 = std::time::Instant::now();
+            let completed = completed.clone();
+            queue.on_submitted_work_done(move || {
+                completed.fetch_max(serial, Ordering::AcqRel);
+            });
+            if let Some(texture) = texture {
+                queue.present(texture);
+            }
+            QUEUE_TIMES[0].fetch_add((t2 - t).as_nanos() as u64, Ordering::Relaxed);
+            QUEUE_TIMES[1].fetch_add((t3 - t2).as_nanos() as u64, Ordering::Relaxed);
+            QUEUE_TIMES[2].fetch_add(t3.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
+    }
+}
+
+/// Time on the render thread, summed (`HZ_WGPU_PROFILE`) and printed per frame every 1000 frames.
+struct Prof {
+    since: std::time::Instant,
+    frames: u32,
+    calls: u64,
+    submits: u64,
+    rust: Duration,
+    /// Waiting for the queue's thread, and for what: how many times, how long.
+    wait: Duration,
+    waits: HashMap<&'static str, (u32, Duration)>,
+}
+
+impl Prof {
+    fn new() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            frames: 0,
+            calls: 0,
+            submits: 0,
+            rust: Duration::ZERO,
+            wait: Duration::ZERO,
+            waits: HashMap::new(),
+        }
+    }
+
+    fn frame(&mut self) {
+        self.frames += 1;
+        if self.frames == 1000 {
+            let us = |d: Duration| d.as_secs_f64() * 1e6 / 1000.0;
+            eprintln!(
+                "[horizon-wgpu] profile per frame: {:.0} us in all, {:.0} in Rust over {} calls ({} submits), \
+                 {:.0} of it waiting for the queue's thread",
+                us(self.since.elapsed()),
+                us(self.rust),
+                self.calls / 1000,
+                self.submits,
+                us(self.wait),
+            );
+            let q = QUEUE_TIMES
+                .each_ref()
+                .map(|t| t.swap(0, Ordering::Relaxed) as f64 / 1e3 / 1000.0);
+            eprintln!(
+                "[horizon-wgpu]   queue thread per frame: acquire and finish {:.0} us, submit {:.0}, present {:.0}",
+                q[0], q[1], q[2]
+            );
+            let mut waits: Vec<_> = self.waits.iter().collect();
+            waits.sort_by_key(|w| std::cmp::Reverse(w.1.1));
+            for (why, (n, d)) in waits {
+                eprintln!(
+                    "[horizon-wgpu]   waits for {why}: {n} times, {:.0} us a frame",
+                    us(*d)
+                );
+            }
+            *self = Self::new();
         }
     }
 }
@@ -303,7 +593,8 @@ impl Ctx {
             data
         };
         if self.pass.is_some() {
-            self.queue.write_buffer(buffer, start, data);
+            self.sender
+                .send(Job::Write(buffer.clone(), start, data.to_vec()));
             return;
         }
         self.recorded = true;
@@ -318,8 +609,13 @@ impl Ctx {
     }
 
     fn submit(&mut self) -> u64 {
+        self.submit_showing(None)
+    }
+
+    /// [`submit`](Self::submit), the queue's thread then drawing the frame to the screen.
+    fn submit_showing(&mut self, show: Option<Show>) -> u64 {
         for (buffer, offset, data) in std::mem::take(&mut self.dirty) {
-            self.queue.write_buffer(&buffer, offset, &data);
+            self.sender.send(Job::Write(buffer, offset, data));
         }
         if self.trace && (self.serial < 400 || self.serial.is_multiple_of(50)) {
             eprintln!(
@@ -361,20 +657,42 @@ impl Ctx {
             }
             self.recorded = true;
         }
-        self.belt.finish();
-        let commands = self.encoder.take().map(|e| e.finish());
-        self.queue.submit(commands);
+        // The belt's memory of the submit before is free to reuse once the queue has that submit.
+        let t = std::time::Instant::now();
+        self.sender.reach(self.sender.last_submit);
+        if let Some(p) = self.prof.as_mut() {
+            let d = t.elapsed();
+            p.wait += d;
+            p.submits += 1;
+            let e = p.waits.entry("submit before").or_default();
+            e.0 += 1;
+            e.1 += d;
+        }
         self.belt.recall();
+        self.belt.finish();
         let serial = self.serial + 1;
+        self.sender
+            .send(Job::Submit(self.encoder.take(), serial, show));
+        self.sender.last_submit = self.sender.sent;
         self.groups.retain(|_, (_, used)| serial - *used <= 3);
         self.recorded = false;
-        self.serial += 1;
-        let serial = self.serial;
-        let completed = self.completed.clone();
-        self.queue.on_submitted_work_done(move || {
-            completed.fetch_max(serial, Ordering::AcqRel);
-        });
+        self.deferred = false;
+        self.serial = serial;
         serial
+    }
+
+    /// Everything handed to the queue so far is in it: before a buffer is mapped (a copy into it may wait in a
+    /// submit not made yet) and before the screen's next texture.
+    fn flush(&mut self, why: &'static str) {
+        let t = std::time::Instant::now();
+        self.sender.reach(self.sender.sent);
+        if let Some(p) = self.prof.as_mut() {
+            let d = t.elapsed();
+            p.wait += d;
+            let e = p.waits.entry(why).or_default();
+            e.0 += 1;
+            e.1 += d;
+        }
     }
 
     fn wait(&mut self, serial: u64, timeout: Option<Duration>) -> bool {
@@ -395,6 +713,65 @@ impl Ctx {
 
 // ---------------------------------------------------------------------------------------------------------------
 // Device
+
+/// A debugging switch (`HZ_WGPU_*`), read once: reading the environment takes a lock (on Windows also a
+/// conversion), too slow for every draw and pass.
+fn env(name: &str) -> Option<&'static str> {
+    static VARS: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
+    VARS.get_or_init(|| {
+        std::env::vars()
+            .filter(|(k, _)| k.starts_with("HZ_WGPU_"))
+            .collect()
+    })
+    .get(name)
+    .map(String::as_str)
+}
+
+/// wgpu's own reports (why an adapter cannot present, validation, driver errors) on stderr, with the game's log:
+/// warnings and errors, or down to `HZ_WGPU_LOG` (`info`, `debug`, `trace`).
+struct Logger(log::LevelFilter);
+
+impl Logger {
+    fn install() {
+        static LOGGER: std::sync::OnceLock<Logger> = std::sync::OnceLock::new();
+        let level = match std::env::var("HZ_WGPU_LOG").as_deref() {
+            Ok("trace") => log::LevelFilter::Trace,
+            Ok("debug") => log::LevelFilter::Debug,
+            Ok("info") => log::LevelFilter::Info,
+            _ => log::LevelFilter::Warn,
+        };
+        let logger = LOGGER.get_or_init(|| Logger(level));
+        if log::set_logger(logger).is_ok() {
+            log::set_max_level(level);
+        }
+    }
+}
+
+impl log::Log for Logger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        // naga warns on every game shader (`Unknown capability SampledBuffer`, which it does not need): its
+        // failures come back as errors anyway. HZ_WGPU_LOG shows them.
+        let level = if metadata.target().starts_with("naga") && self.0 == log::LevelFilter::Warn {
+            log::LevelFilter::Error
+        } else {
+            self.0
+        };
+        metadata.level() <= level
+    }
+
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!(
+                "[horizon-wgpu] {} {}: {}",
+                record.level(),
+                record.target(),
+                record.args()
+            );
+        }
+    }
+
+    fn flush(&self) {}
+}
 
 /// The graphics APIs to try, in order: Vulkan first (its rasterizer rounds as the game's own Vulkan and OpenGL
 /// backends do: the same frame to the pixel, where DX12 places pixels on exact triangle edges differently), then
@@ -422,15 +799,21 @@ fn apis() -> Vec<wgpu::Backends> {
 /// `probe` is null or a [`window_target`] description of a live window.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hz_create(probe: *const c_void) -> *mut Ctx {
+    Logger::install();
     let mut chosen = None;
     for backends in apis() {
+        // No checks wgpu adds over the API's own: in a release build that is the compute pass it runs before
+        // every indirect draw to bound its arguments (a browser's guard against hostile pages; the game is the
+        // same code the game's own Vulkan backend trusts). WGPU_VALIDATION_INDIRECT_CALL=1 and the other WGPU_*
+        // flags turn them back on.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
+            flags: wgpu::InstanceFlags::empty().with_env(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         // SAFETY: as the caller promises.
         // Headless (HZ_WGPU_HEADLESS), frames are never shown: any adapter of the API will do.
-        let headless = std::env::var_os("HZ_WGPU_HEADLESS").is_some();
+        let headless = env("HZ_WGPU_HEADLESS").is_some();
         let target = unsafe { probe.cast::<WindowTarget>().as_ref() }.filter(|_| !headless);
         let surface = match target {
             None => None,
@@ -497,6 +880,8 @@ pub unsafe extern "C" fn hz_create(probe: *const c_void) -> *mut Ctx {
         }
     }));
     let belt = wgpu::util::StagingBelt::new(device.clone(), 4 << 20);
+    let completed = Arc::new(AtomicU64::new(0));
+    let sender = Sender::new(queue.clone(), completed.clone());
     Box::into_raw(Box::new(Ctx {
         instance,
         adapter,
@@ -504,10 +889,13 @@ pub unsafe extern "C" fn hz_create(probe: *const c_void) -> *mut Ctx {
         queue,
         encoder: None,
         recorded: false,
+        deferred: false,
+        prof: env("HZ_WGPU_PROFILE").map(|_| Prof::new()),
+        sender,
         pass: None,
         dirty: Vec::new(),
         serial: 0,
-        completed: Arc::new(AtomicU64::new(0)),
+        completed,
         messages,
         error: String::new(),
         blits: HashMap::new(),
@@ -522,7 +910,7 @@ pub unsafe extern "C" fn hz_create(probe: *const c_void) -> *mut Ctx {
         textures: Vec::new(),
         dump_next: false,
         dump_passes: None,
-        trace: std::env::var_os("HZ_WGPU_TRACE").is_some(),
+        trace: env("HZ_WGPU_TRACE").is_some(),
         passes: 0,
         draws: 0,
         writes: 0,
@@ -621,13 +1009,21 @@ pub unsafe extern "C" fn hz_messages(ctx: *mut Ctx, out: *mut u8, cap: u32) -> u
 
 /// Submits what was recorded; the submission's serial.
 ///
+/// The game submits its frame and then presents it, which submits the blit to the screen: two submits a frame,
+/// each a fixed cost in wgpu. So a submit waits for the next one (the present's, or a second submit), and goes
+/// sooner only when something waits on it ([`hz_wait`]), as a fence does.
+///
 /// # Safety
 /// `ctx` is live.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hz_submit(ctx: *mut Ctx) -> u64 {
     guard(ctx, 0, |ctx| {
         ctx.no_pass("submit")?;
-        Ok(ctx.submit())
+        if ctx.deferred {
+            return Ok(ctx.submit());
+        }
+        ctx.deferred = true;
+        Ok(ctx.serial + 1)
     })
 }
 
@@ -673,7 +1069,7 @@ pub unsafe extern "C" fn hz_wait(ctx: *mut Ctx, serial: u64, timeout_ns: i64) ->
 pub unsafe extern "C" fn hz_fence(ctx: *mut Ctx) -> u64 {
     guard(ctx, 0, |ctx| {
         Ok(
-            if ctx.pass.is_some() || ctx.recorded || !ctx.dirty.is_empty() {
+            if ctx.pass.is_some() || ctx.recorded || ctx.deferred || !ctx.dirty.is_empty() {
                 ctx.serial + 1
             } else {
                 ctx.serial
@@ -826,6 +1222,7 @@ pub unsafe extern "C" fn hz_buffer_read(
         let slice = buf.buffer.slice(start..end);
         let done = Arc::new(Mutex::new(None));
         let set = done.clone();
+        ctx.flush("read");
         slice.map_async(wgpu::MapMode::Read, move |r| {
             if let Ok(mut d) = set.lock() {
                 *d = Some(r.is_ok());
@@ -920,7 +1317,7 @@ pub unsafe extern "C" fn hz_texture_create(
             usage: usages,
             view_formats: &[],
         });
-        if std::env::var_os("HZ_WGPU_DUMP_ALL").is_some() && fmt == TextureFormat::Rgba8Unorm {
+        if env("HZ_WGPU_DUMP_ALL").is_some() && fmt == TextureFormat::Rgba8Unorm {
             ctx.textures.push(texture.clone());
         }
         Ok(Box::into_raw(Box::new(Tex {
@@ -1078,16 +1475,14 @@ pub unsafe extern "C" fn hz_texture_write(
         };
         let row = width * bpp;
         if ctx.pass.is_some() {
-            ctx.queue.write_texture(
-                target,
-                &data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(row),
-                    rows_per_image: Some(height),
-                },
+            ctx.sender.send(Job::WriteTexture(
+                tex.texture.clone(),
+                mip,
+                target.origin,
+                data,
+                row,
                 extent,
-            );
+            ));
             return Ok(());
         }
         let padded = row.div_ceil(256) * 256;
@@ -1909,7 +2304,7 @@ pub unsafe extern "C" fn hz_pipeline_create(
         let texels = texel_formats(d);
         let (v, f) = on_big_stack(|| -> Result<_, String> {
             let overridden = |what: &str| {
-                let dir = std::env::var_os("HZ_WGPU_OVERRIDE")?;
+                let dir = env("HZ_WGPU_OVERRIDE")?;
                 let file = format!("{}.{what}.wgsl", name.replace([':', '/'], "_"));
                 std::fs::read_to_string(std::path::Path::new(&dir).join(file)).ok()
             };
@@ -1953,7 +2348,7 @@ pub unsafe extern "C" fn hz_pipeline_create(
             validate(&v.module, "vertex")?;
             validate(&f.module, "fragment")?;
             // Debugging (`HZ_WGPU_WGSL=folder`): each pipeline's shaders as wgpu gets them, as WGSL.
-            if let Some(dir) = std::env::var_os("HZ_WGPU_WGSL") {
+            if let Some(dir) = env("HZ_WGPU_WGSL") {
                 for (m, what) in [(&v.module, "vs"), (&f.module, "fs")] {
                     let info = naga::valid::Validator::new(
                         naga::valid::ValidationFlags::all(),
@@ -2548,6 +2943,8 @@ pub unsafe extern "C" fn hz_pass_begin(
             variant: None,
             index_format: wgpu::IndexFormat::Uint16,
             index: None,
+            vertex: Vec::new(),
+            groups: Vec::new(),
             first_color: views
                 .iter()
                 .flatten()
@@ -2566,7 +2963,7 @@ pub unsafe extern "C" fn hz_pass_end(ctx: *mut Ctx) {
         let pass = ctx.pass.take();
         if let (Some(n), Some(dir), Some((texture, mip))) = (
             ctx.dump_passes,
-            std::env::var_os("HZ_WGPU_DUMP_ALL"),
+            env("HZ_WGPU_DUMP_ALL"),
             pass.and_then(|p| p.first_color),
         ) {
             ctx.dump_passes = Some(n + 1);
@@ -2723,7 +3120,17 @@ pub unsafe extern "C" fn hz_pass_vertex(
         } else {
             offset + len
         };
+        let slot_state = Some((buffer, offset, end));
+        let i = slot as usize;
+        if pass.vertex.get(i) == Some(&slot_state) {
+            return Ok(());
+        }
+        if pass.vertex.len() <= i {
+            pass.vertex.resize(i + 1, None);
+        }
+        let (buffer, ..) = slot_state.as_ref().expect("just made");
         pass.pass.set_vertex_buffer(slot, buffer.slice(offset..end));
+        pass.vertex[i] = slot_state;
         Ok(())
     })
 }
@@ -2738,11 +3145,15 @@ pub unsafe extern "C" fn hz_pass_index(ctx: *mut Ctx, buf: *const Buf, int32: u3
         // SAFETY: as the caller promises.
         let buffer = unsafe { &*buf }.buffer.clone();
         let pass = pass(ctx)?;
-        pass.index_format = if int32 != 0 {
+        let format = if int32 != 0 {
             wgpu::IndexFormat::Uint32
         } else {
             wgpu::IndexFormat::Uint16
         };
+        if pass.index.as_ref() == Some(&buffer) && pass.index_format == format {
+            return Ok(());
+        }
+        pass.index_format = format;
         pass.pass
             .set_index_buffer(buffer.slice(..), pass.index_format);
         pass.index = Some(buffer);
@@ -2785,7 +3196,7 @@ fn prepare(ctx: &mut Ctx) -> Result<(), String> {
         Some(v) => v,
         None => on_big_stack(|| pipeline.variant(&device, &key)),
     };
-    if std::env::var_os("HZ_WGPU_TRACE").is_some()
+    if env("HZ_WGPU_TRACE").is_some()
         && pipeline.variants.borrow().len() == 1
         && pass.variant.is_none()
     {
@@ -2898,7 +3309,17 @@ fn prepare(ctx: &mut Ctx) -> Result<(), String> {
                 g
             }
         };
-        pass.pass.set_bind_group(*group, &group_obj, &offsets);
+        let g = *group as usize;
+        if pass.groups.len() <= g {
+            pass.groups.resize(g + 1, None);
+        }
+        if pass.groups[g]
+            .as_ref()
+            .is_none_or(|(b, o)| *b != group_obj || *o != offsets)
+        {
+            pass.pass.set_bind_group(*group, &group_obj, &offsets);
+            pass.groups[g] = Some((group_obj, offsets));
+        }
     }
     pass.variant = Some(variant);
     pass.dirty = false;
@@ -3221,17 +3642,19 @@ pub unsafe extern "C" fn hz_surface_create(
     target: *const WindowTarget,
 ) -> *mut Surface {
     guard(ctx, std::ptr::null_mut(), |ctx| {
-        if std::env::var_os("HZ_WGPU_HEADLESS").is_some() {
+        if env("HZ_WGPU_HEADLESS").is_some() {
             return Ok(Box::into_raw(Box::new(Surface {
                 surface: None,
                 config: None,
-                current: None,
-                suboptimal: false,
+                status: Arc::default(),
+                suboptimal: Arc::default(),
+                blit: None,
+                presenting: None,
             })));
         }
         // SAFETY: as the caller promises.
         let surface = unsafe { create_surface(&ctx.instance, &*target)? };
-        if std::env::var_os("HZ_WGPU_TRACE").is_some() {
+        if env("HZ_WGPU_TRACE").is_some() {
             for a in pollster::block_on(ctx.instance.enumerate_adapters(wgpu::Backends::all())) {
                 eprintln!(
                     "[horizon-wgpu] adapter {:?} {} {:?}: surface supported {}",
@@ -3243,10 +3666,12 @@ pub unsafe extern "C" fn hz_surface_create(
             }
         }
         Ok(Box::into_raw(Box::new(Surface {
-            surface: Some(surface),
+            surface: Some(Arc::new(surface)),
             config: None,
-            current: None,
-            suboptimal: false,
+            status: Arc::default(),
+            suboptimal: Arc::default(),
+            blit: None,
+            presenting: None,
         })))
     })
 }
@@ -3257,7 +3682,13 @@ pub unsafe extern "C" fn hz_surface_create(
 pub unsafe extern "C" fn hz_surface_free(s: *mut Surface) {
     if !s.is_null() {
         // SAFETY: as the caller promises.
-        drop(unsafe { Box::from_raw(s) });
+        let s = unsafe { Box::from_raw(s) };
+        if let Some((done, job)) = &s.presenting {
+            while done.load(Ordering::Acquire) < *job {
+                std::thread::yield_now();
+            }
+        }
+        drop(s);
     }
 }
 
@@ -3275,6 +3706,8 @@ pub unsafe extern "C" fn hz_surface_configure(
     mode: u32,
 ) -> u32 {
     guard(ctx, 0, |ctx| {
+        // No texture of the old configuration still on its way to the screen.
+        ctx.flush("configure");
         // SAFETY: as the caller promises.
         let s = unsafe { &mut *s };
         let Some(surface) = s.surface.as_ref() else {
@@ -3320,8 +3753,16 @@ pub unsafe extern "C" fn hz_surface_configure(
             view_formats: vec![],
             color_space: Default::default(),
         };
-        s.current = None;
+        log::info!(
+            "surface {}x{} {:?}, {:?} of {:?}",
+            config.width,
+            config.height,
+            config.format,
+            config.present_mode,
+            caps.present_modes
+        );
         surface.configure(&ctx.device, &config);
+        s.status.store(1, Ordering::Release);
         s.config = Some(config);
         Ok(1)
     })
@@ -3354,8 +3795,12 @@ pub unsafe extern "C" fn hz_surface_modes(ctx: *mut Ctx, s: *mut Surface) -> u32
     })
 }
 
-/// Acquires the next texture: 1 done, 0 skip this frame (occluded or timed out), -1 out of date (configure
-/// again), -2 lost.
+/// Whether to draw a frame for the screen: 1 yes, 0 skip this frame (occluded or timed out), -1 out of date
+/// (configure again), -2 lost.
+///
+/// The game asks at the start of a frame. The texture itself is acquired by the queue's thread at the present
+/// (see [`Blit`]), so the render thread never waits for the screen; this answers with what that thread got the
+/// frame before, as a texture the game's own Vulkan backend acquires but cannot use tells it the frame after.
 ///
 /// # Safety
 /// `ctx` and `s` are live.
@@ -3363,26 +3808,12 @@ pub unsafe extern "C" fn hz_surface_modes(ctx: *mut Ctx, s: *mut Surface) -> u32
 pub unsafe extern "C" fn hz_surface_acquire(ctx: *mut Ctx, s: *mut Surface) -> i32 {
     guard(ctx, -2, |_| {
         // SAFETY: as the caller promises.
-        let s = unsafe { &mut *s };
-        s.current = None;
-        let Some(surface) = s.surface.as_ref() else {
+        let s = unsafe { &*s };
+        if s.surface.is_none() {
             return Ok(1);
-        };
-        Ok(match surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => {
-                s.suboptimal = false;
-                s.current = Some(t);
-                1
-            }
-            wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
-                s.suboptimal = true;
-                s.current = Some(t);
-                1
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => 0,
-            wgpu::CurrentSurfaceTexture::Outdated => -1,
-            _ => -2,
-        })
+        }
+        // Reported once: the next frame tries again (or, out of date, the game configures first).
+        Ok(s.status.swap(1, Ordering::AcqRel))
     })
 }
 
@@ -3391,7 +3822,7 @@ pub unsafe extern "C" fn hz_surface_acquire(ctx: *mut Ctx, s: *mut Surface) -> i
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn hz_surface_suboptimal(s: *mut Surface) -> u32 {
     // SAFETY: as the caller promises.
-    u32::from(unsafe { &*s }.suboptimal)
+    u32::from(unsafe { &*s }.suboptimal.load(Ordering::Acquire))
 }
 
 /// Draws the game's frame (`view`) into the acquired texture, flipped back to the screen's row order.
@@ -3404,16 +3835,12 @@ pub unsafe extern "C" fn hz_surface_blit(ctx: *mut Ctx, s: *mut Surface, view: *
         ctx.no_pass("blitFromTexture")?;
         // SAFETY: as the caller promises.
         let (s, view) = unsafe { (&mut *s, &**view) };
-        let Some(current) = s.current.as_ref() else {
+        let Some(config) = s.config.as_ref() else {
             return Ok(());
         };
-        let format = current.texture.format();
+        let format = config.format;
         let pipeline = blit_pipeline(ctx, format);
-        let target = current.texture.create_view(&Default::default());
-        let (w, h) = (
-            view.width.min(current.texture.width()),
-            view.height.min(current.texture.height()),
-        );
+        let (w, h) = (view.width.min(config.width), view.height.min(config.height));
         let uniform = ctx.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("horizon blit"),
             size: 16,
@@ -3438,17 +3865,16 @@ pub unsafe extern "C" fn hz_surface_blit(ctx: *mut Ctx, s: *mut Surface, view: *
         ctx.presented += 1;
         let dump_frame = std::mem::take(&mut ctx.dump_next)
             || ctx.presented
-                == std::env::var("HZ_WGPU_DUMP_FRAME")
-                    .ok()
+                == env("HZ_WGPU_DUMP_FRAME")
                     .and_then(|v| v.parse().ok())
                     .unwrap_or(u64::MAX);
         // The pass dumps cover the frame after a dump.
-        ctx.dump_passes = if dump_frame && std::env::var_os("HZ_WGPU_DUMP_ALL").is_some() {
+        ctx.dump_passes = if dump_frame && env("HZ_WGPU_DUMP_ALL").is_some() {
             Some(0)
         } else {
             None
         };
-        if let Some(dir) = std::env::var_os("HZ_WGPU_DUMP_ALL")
+        if let Some(dir) = env("HZ_WGPU_DUMP_ALL")
             && dump_frame
         {
             let textures = std::mem::take(&mut ctx.textures);
@@ -3472,10 +3898,10 @@ pub unsafe extern "C" fn hz_surface_blit(ctx: *mut Ctx, s: *mut Surface, view: *
                 }
             }
         }
-        if let Ok(path) = std::env::var("HZ_WGPU_DUMP")
+        if let Some(path) = env("HZ_WGPU_DUMP")
             && dump_frame
         {
-            dump(ctx, view, &path);
+            dump(ctx, view, path);
         }
         let bind = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: None,
@@ -3491,26 +3917,11 @@ pub unsafe extern "C" fn hz_surface_blit(ctx: *mut Ctx, s: *mut Surface, view: *
                 },
             ],
         });
-        let encoder = ctx.encoder();
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("horizon present"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            ..Default::default()
+        s.blit = Some(Blit {
+            pipeline,
+            bind,
+            size: (w, h),
         });
-        if w > 0 && h > 0 {
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &bind, &[]);
-            pass.set_viewport(0.0, 0.0, w as f32, h as f32, 0.0, 1.0);
-            pass.draw(0..3, 0..1);
-        }
         Ok(())
     })
 }
@@ -3568,6 +3979,7 @@ fn dump_texture(ctx: &mut Ctx, texture: &wgpu::Texture, mip: u32, path: &str) {
         },
     );
     ctx.submit();
+    ctx.flush("dump");
     buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
     let _ = ctx.device.poll(wgpu::PollType::wait_indefinitely());
     let Ok(data) = buffer.slice(..).get_mapped_range() else {
@@ -3692,9 +4104,27 @@ pub unsafe extern "C" fn hz_surface_present(ctx: *mut Ctx, s: *mut Surface) -> u
         ctx.no_pass("present")?;
         // SAFETY: as the caller promises.
         let s = unsafe { &mut *s };
-        let serial = ctx.submit();
-        if let Some(t) = s.current.take() {
-            ctx.queue.present(t);
+        let show = match (s.surface.as_ref(), s.blit.take()) {
+            (Some(surface), Some(blit)) => {
+                // The blit goes into the frame's own encoder.
+                ctx.encoder();
+                ctx.recorded = true;
+                Some(Show {
+                    surface: surface.clone(),
+                    blit,
+                    status: s.status.clone(),
+                    suboptimal: s.suboptimal.clone(),
+                })
+            }
+            _ => None,
+        };
+        let shown = show.is_some();
+        let serial = ctx.submit_showing(show);
+        if shown {
+            s.presenting = Some((ctx.sender.done.clone(), ctx.sender.sent));
+            if let Some(p) = ctx.prof.as_mut() {
+                p.frame();
+            }
         }
         Ok(serial)
     })
@@ -3835,6 +4265,7 @@ pub unsafe extern "C" fn hz_timestamps_read(
         let slice = p.read.slice(..);
         let mapped = Arc::new(AtomicU64::new(0));
         let flag = mapped.clone();
+        ctx.flush("timestamps");
         slice.map_async(wgpu::MapMode::Read, move |r| {
             flag.store(if r.is_ok() { 1 } else { 2 }, Ordering::Release);
         });

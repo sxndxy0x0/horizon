@@ -180,7 +180,8 @@ def main() -> int:
         shot.unlink(missing_ok=True)
         # The launcher's JVM arguments from the version file that change how native code runs: a larger stack
         # shadow zone (native code past it kills the process without a JVM crash report) and the stack size.
-        cmd = [java, "-Xmx2g", "-Xss1M", "-XX:StackShadowPages=32", "--enable-native-access=ALL-UNNAMED", f"-XX:ErrorFile={out / (backend + '-hs_err.log')}", *os.environ.get("HZ_JVM_EXTRA", "").split(), f"-Djava.library.path={natives}",
+        # hz.render.only: the one backend alone, never quietly the game's own (HZ_JVM_EXTRA, after it, may differ).
+        cmd = [java, "-Xmx2g", "-Xss1M", "-XX:StackShadowPages=32", "--enable-native-access=ALL-UNNAMED", f"-XX:ErrorFile={out / (backend + '-hs_err.log')}", "-Dhz.render.only=true", *os.environ.get("HZ_JVM_EXTRA", "").split(), f"-Djava.library.path={natives}",
                f"-javaagent:{jar}", f"-Dhz.render={backend}", f"-Dhz.capture={shot}",
                f"-Dhz.capture.frames={frames}", f"-Dhz.wgpu.lib={lib}", "-Dhz.capture.world=" + str(bool(args.world)).lower(),
                f"-Dhz.capture.view={args.view}", "-Dhz.capture.hold=" + str(args.hold if args.hold is not None else (30 if args.world else 0)), "-Dhz.trace=" + str(bool(os.environ.get('HZ_WGPU_TRACE'))).lower(),
@@ -207,7 +208,7 @@ def main() -> int:
     report = ["# P3 report", ""]
     for backend, r in results.items():
         report.append(f"- {backend}: " + (f"frame after {r.get('frames')} frames, {r.get('ms per frame')} ms "
-                                          f"a frame, longest stall {r.get('longest tick gap ms')} ms, {r.get('size')}" if r["ok"] else f"failed, see {r['log']}"))
+                                          f"a frame, longest stall {r.get('longest tick gap ms')} ms, {r.get('size')}, drawn by {r.get('backend')}" if r["ok"] else f"failed, see {r['log']}"))
     ok = all(r["ok"] for r in results.values())
     base = "opengl" if "opengl" in results else None
     for backend in results:

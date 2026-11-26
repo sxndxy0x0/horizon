@@ -107,7 +107,7 @@
 
 1. ✅ **P1 Agent + diff ของ bytecode:** บูต Fabric 26.3 และ NeoForge 26.3 จริงพร้อมม็อดตัวอย่างใน JVM ธรรมดา แล้วให้ agent ออกรายงานว่าม็อดแตะ method ไหน ยังไม่ต้องใช้ Horizon เครื่องนี้มี Fabric 26.3 อยู่แล้ว
 2. ✅ **P2 หน่วยความจำร่วม:** บล็อก แสง และ heightmap ของเกม Java ตัวจริงอยู่บนหน่วยความจำของ Rust โลกจริงที่แก้แล้วให้แสงแล้วเซฟออกมาตรงกับ vanilla ทุก chunk และ `LevelAccess` ของ Horizon อ่านเขียนโลกที่กำลังรันอยู่ได้ตรง
-3. ✅ **P3 วาดภาพ:** Java client จริงวาดผ่าน backend wgpu ของ Horizon ทั้งหน้า title (ตรง OpenGL ทุก pixel) และในโลก (ต่างจาก OpenGL น้อยกว่าที่ Vulkan ของ Mojang ต่าง)
+3. ✅ **P3 วาดภาพ:** Java client จริงวาดผ่าน backend wgpu ของ Horizon ทั้งหน้า title (ตรง OpenGL ทุก pixel) และในโลก (ต่างจาก OpenGL น้อยกว่าที่ Vulkan ของ Mojang ต่าง) เร็วกว่า Vulkan ของ Mojang เล็กน้อย และถอยไปใช้ backend ของเกมเองเมื่อ wgpu ใช้ไม่ได้
 4. **P4 accelerator ตัวแรก:** ระบบไฟ เปิดเมื่อแผนบอกว่าปลอดภัย และผ่าน parity harness เดิม
 
 ## ผล P1 (2026-11-25)
@@ -276,7 +276,9 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
 - **ฝั่ง Java:** `mods/horizon/src/wgpu-backend/`
   - `WgpuBackend` เป็น backend ตัวที่สามของเกม คู่กับ OpenGL และ Vulkan ของ Mojang
   - ชั้น frontend ของ renderpearl (ตรวจความถูกต้อง, คอมไพล์ GLSL เป็น SPIR-V) ทำงานตามเดิม เราเขียนเฉพาะชั้น backend 4 interface คือ `GpuDeviceBackend`, `CommandEncoderBackend`, `RenderPassBackend` และ `GpuSurfaceBackend`
-  - Agent เปลี่ยน `PreferredGraphicsApi.getBackendsToTry` ให้คืน backend ที่เลือกผ่าน `-Dhz.render=wgpu|opengl|vulkan`
+  - Agent เปลี่ยน `PreferredGraphicsApi.getBackendsToTry` ตาม `-Dhz.render=wgpu|opengl|vulkan`
+    - `wgpu`: ลอง wgpu ก่อน แล้วตามด้วยรายการเดิมของเกม เครื่องที่ wgpu ใช้ไม่ได้จึงยังเปิดเกมด้วย OpenGL หรือ Vulkan ของเกมได้
+    - `opengl`, `vulkan` หรือมี `-Dhz.render.only=true`: ใช้ตัวนั้นตัวเดียว (ตัวทดลองใช้แบบนี้ เพื่อไม่ให้แอบไปวัด backend อื่น)
 - **ฝั่ง Rust:** crate `crates/horizon-wgpu-backend` (cdylib) เรียกผ่าน FFM ใช้ wgpu 30 ตัวเดียวกับที่ Horizon ใช้
   - เลือก API ตัวแรกที่วาดลงหน้าต่างแบบเดียวกับของเกมได้ เรียงเป็น Vulkan, DX12, Metal, GL (`HZ_WGPU_BACKEND=vulkan|dx12|metal|gl` บังคับได้)
 - **วิธีทดสอบ:**
@@ -345,7 +347,8 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
 | OpenGL (Mojang) | 3.8–4.2 |
 | Vulkan (Mojang) | 5.5 |
 | wgpu ก่อนรอบนี้ | 10.6 |
-| **wgpu ตอนนี้** | **6.0–6.8** |
+| wgpu หลังรอบสอง | 6.0–6.8 |
+| **wgpu หลังรอบสาม** | **3.85–3.88** (Vulkan ของ Mojang รอบเดียวกัน 3.89–3.99) |
 
 #### ที่แก้
 
@@ -379,16 +382,47 @@ python -m unittest tests.test_loader_probe                     # 8 เทสต�
   - `HZ_WGPU_DUMP_ALL` เก็บ texture และผลของแต่ละ pass
   - `HZ_WGPU_HEADLESS` วาดโดยไม่ขึ้นจอ (ตอนนี้ไม่ต้องให้ API รองรับหน้าต่างด้วย)
 
+### รอบที่สาม (2026-11-26): เก็บของที่ค้าง
+
+- **ความเร็ว: แซง Vulkan ของ Mojang** (วัดสลับกันรอบละตัว เพราะความเร็วของเครื่องเปลี่ยนไปมาเกิน 30% ในชั่วโมงเดียว):
+
+| backend | ms ต่อเฟรม (3 รอบ) |
+|---|---:|
+| Vulkan (Mojang) | 3.89–3.99 |
+| **wgpu (Horizon)** | **3.85–3.88** |
+
+  - ภาพยังถูก: หน้า title ตรง OpenGL ทุก pixel, ในโลกต่างจาก OpenGL 0.0018 (Vulkan ของ Mojang 0.040)
+  - **ปิดการตรวจ indirect draw ของ wgpu:** build แบบ release ของ wgpu ยังเปิด `VALIDATION_INDIRECT_CALL` ซึ่งรัน compute pass ตรวจ argument ก่อนทุก indirect draw (กันหน้าเว็บที่ประสงค์ร้ายในเบราว์เซอร์)
+    - terrain ของเกมวาดผ่าน indirect จึงโดนทุกเฟรม
+    - ปิดแล้วเวลาลดจาก 7.1 เหลือ 5.6 ms ในรอบที่วัดติดกัน (Vulkan ของ Mojang ก็ไม่ได้ตรวจ)
+    - `WGPU_VALIDATION_INDIRECT_CALL=1` และ `WGPU_*` ตัวอื่นเปิดกลับได้
+  - **ส่งงานให้ queue บน thread แยก:** วัดด้วย `HZ_WGPU_PROFILE=1` แล้วพบว่า render thread ใช้เวลาใน Rust 2.6 ms ต่อเฟรม เป็นการ `finish` ของ encoder (wgpu replay และตรวจทุกคำสั่ง), submit และ present รวม 1.7 ms
+    - thread `horizon-wgpu queue` จึงรับงานของ queue ทั้งหมดตามลำดับ (เขียน buffer/texture, finish + submit, ขอ texture ของจอ, blit, present) ระหว่างที่ render thread บันทึกเฟรมถัดไป
+    - render thread รอ thread นี้เฉพาะก่อน map buffer (copy ลง buffer นั้นอาจยังไม่ถูก submit), ก่อน configure หน้าต่าง และก่อนคืนหน่วยความจำของ `StagingBelt`
+    - เกมขอ texture ของจอตอน**ต้น**เฟรม ถ้าขอจริงตรงนั้นต้องรอ present ของเฟรมก่อนจนไม่เหลือส่วนที่ทำพร้อมกัน texture จึงถูกขอโดย thread ของ queue ตอน present และคำตอบที่ให้เกม (occluded, out of date) มาจากรอบก่อน
+    - ตอนนี้ render thread รอ thread นี้เหลือราว 0.04 ms ต่อเฟรม
+    - `HZ_WGPU_SYNC=1` ทำทุกอย่างบน render thread แบบเดิม
+  - **submit ของเกมรอรวมกับของ present:** เหลือ submit เดียวต่อเฟรม และจะ submit ก่อนก็ต่อเมื่อมีคนรอ fence
+  - **อ่าน environment ครั้งเดียว:** สวิตช์ดีบัก `HZ_WGPU_*` เคยถูกอ่านทุก draw ที่ state เปลี่ยนและทุก pass ซึ่งบน Windows ต้องถือ lock และแปลงสตริงทุกครั้ง
+  - **ไม่ตั้ง vertex buffer, index buffer หรือ bind group ซ้ำกับที่ผูกอยู่แล้ว**
+- **wgpu สร้าง device ไม่ได้ → เกมค้าง:** ไม่ได้ค้างจริง แต่เกมไม่เหลือ backend อื่นให้ลอง จึงเปิดกล่อง error ที่รอคนกด
+  - ตอนนี้ `hz.render=wgpu` จะถอยไปใช้ backend ของเกมเอง ทดสอบด้วย `HZ_WGPU_BACKEND=metal` บน Windows (ไม่มี adapter): เกมเปิดด้วย OpenGL
+  - ตอนจับภาพ กล่อง error ของเกมกลายเป็นข้อความใน log แล้วเกมปิดเอง (ใช้เวลา 25 วินาที แทนการค้างจนครบ 10 นาที)
+  - รายงานของตัวทดลองบอกด้วยว่าภาพวาดด้วย backend ไหน (`drawn by`)
+- **ตอนจับภาพ เกมไม่อ่านเมาส์จริง:** ถ้าเมาส์ค้างอยู่บนหน้าต่าง ปุ่มใต้เมาส์จะเรืองแสงในรอบหนึ่งแต่ไม่เรืองในอีกรอบ (เจอจริงในรอบนี้ ปุ่ม Multiplayer ต่างไป 1.5 หมื่น pixel)
+- **log ของ wgpu:** crate มี logger แล้ว เหตุผลที่ wgpu-hal ปฏิเสธ adapter หรือ surface จึงขึ้นใน log ของเกม (`HZ_WGPU_LOG=info|debug|trace` ดูละเอียดขึ้น)
+- **macOS:** หน้าต่างของ backend นี้และหน้าต่างทดสอบมี `SDL_WINDOW_METAL` ตามที่ SDL ต้องการสำหรับ Metal view
+
 ### ที่ยังเหลือ
 
-- **Vulkan ของ wgpu บนไดรเวอร์ AMD เครื่องนี้บางช่วงไม่ยอมรับหน้าต่างของเกม** (`vulkan not compatible with provided surface`):
-  - เกิดเป็นช่วง ๆ และยังไม่รู้สาเหตุ ช่วงที่เจอตลอดคือตอนไม่มีใครใช้เครื่อง (คาดว่าเพราะจอดับ)
-  - ช่วงนั้นจะใช้ DX12 แทน ซึ่งภาพในโลกถูกต้อง แต่ขอบโลโก้ต่าง 0.2% ของ pixel
-  - Vulkan ของ Mojang ขึ้นจอได้ในช่วงเดียวกัน ปัญหาจึงอยู่ที่การเช็ก surface ฝั่ง wgpu
-  - ผลเทียบภาพในรอบนี้ใช้ `HZ_WGPU_BACKEND=vulkan HZ_WGPU_HEADLESS=1`
-  - ตัวเลขความเร็วด้านบนวัดตอนที่ Vulkan ขึ้นจอได้
-- **ยังช้ากว่า Vulkan ของ Mojang ราว 1 ms ต่อเฟรม:** ส่วนใหญ่อยู่ที่ `finish`/`submit` ของ wgpu-core (บันทึกคำสั่งและติดตาม resource) และการ present
-- **หน้าต่างนอก Windows ยังไม่ได้ทดสอบ**
+- **Vulkan ของ wgpu ไม่รับหน้าต่างของเกม (เจอเมื่อคืน 2026-11-25 ทุกรอบตอนไม่มีคนใช้เครื่อง):** ทำให้เกิดซ้ำไม่ได้แล้ว
+  - ปิดจอด้วยคำสั่งของ Windows แล้วรันเกม Vulkan ของ wgpu ก็ยังขึ้นหน้าต่างได้ปกติ
+  - ถ้าเกิดอีก log จะบอกว่า Vulkan call ตัวไหนตอบปฏิเสธ ระหว่างนั้นเกมใช้ DX12 ซึ่งวาดถูกต้อง
+- **DX12 ต่างจาก OpenGL ที่ขอบโลโก้ (ราว 1% ของ pixel ในกรอบโลโก้, เฉลี่ย 0.45/255):**
+  - pixel ที่ต่างส่วนใหญ่ไม่ใช่การเลือก texel ข้าง ๆ แต่เป็นสีที่ผสมด้วยน้ำหนักต่างไปเล็กน้อย แปลว่าค่าพิกัด texture ที่ได้ต่อ pixel ต่างกันในทศนิยมท้าย ๆ
+  - เปิด IEEE strictness ของ FXC แล้วไม่เปลี่ยน จึงไม่ได้มาจากการ optimize shader
+  - Vulkan ของ wgpu ตรงทุก pixel บนการ์ดเดียวกัน และ DX12 ใช้เฉพาะตอน Vulkan ใช้ไม่ได้
+- **หน้าต่างนอก Windows ยังไม่ได้รันจริง:** เครื่องนี้มีแต่ Windows (ไม่มี WSL และไม่มี target ของ Linux/macOS)
 
 ## เอาอะไรจาก forge/ari มาใช้
 

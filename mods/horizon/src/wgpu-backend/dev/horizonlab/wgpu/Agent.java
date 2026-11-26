@@ -16,8 +16,15 @@ import org.objectweb.asm.tree.VarInsnNode;
 
 /**
  * Picks the game's graphics backend ({@code hz.render}: {@code wgpu}, {@code opengl} or {@code vulkan}) by
- * rewriting {@code PreferredGraphicsApi.getBackendsToTry} to return that one alone; works on the bytes any loader
- * defines, like the other probes' agents.
+ * rewriting {@code PreferredGraphicsApi.getBackendsToTry}; works on the bytes any loader defines, like the other
+ * probes' agents.
+ *
+ * <ul>
+ *   <li>{@code wgpu}: Horizon's backend first, then the game's own list, so a machine wgpu cannot draw on still
+ *       starts on the game's OpenGL or Vulkan.
+ *   <li>{@code opengl}, {@code vulkan}, or any with {@code hz.render.only=true}: that one alone (to compare
+ *       backends, a run never quietly draws with another).
+ * </ul>
  *
  * <p>With {@code hz.capture} (an output path) it also hands every client tick to {@link Capture}, which saves the
  * title screen once it has drawn for a while and exits, and takes the random splash text off that screen.
@@ -39,6 +46,10 @@ public final class Agent {
                 try {
                     return switch (name) {
                         case API -> rewrite(bytes, Agent::backends);
+                        case "net/minecraft/client/MouseHandler" ->
+                                System.getProperty("hz.capture") == null ? null : rewrite(bytes, Agent::noMouse);
+                        case "com/mojang/blaze3d/platform/MessageBox" ->
+                                System.getProperty("hz.capture") == null ? null : rewrite(bytes, Agent::noDialog);
                         case "net/minecraft/client/Minecraft" -> System.getProperty("hz.capture") == null ? null
                                 : rewrite(bytes, Agent::tick);
                         case "net/minecraft/client/resources/SplashManager" ->
@@ -79,7 +90,20 @@ public final class Agent {
         if (chosen == null) {
             return false;
         }
+        boolean alone = !chosen.startsWith("dev/") || Boolean.getBoolean("hz.render.only");
         for (MethodNode m : node.methods) {
+            if (m.name.equals("getBackendsToTry") && !alone) {
+                // Before each return: Agent.withWgpu(theGamesList).
+                for (var insn : m.instructions.toArray()) {
+                    if (insn.getOpcode() == Opcodes.ARETURN) {
+                        m.instructions.insertBefore(insn, new MethodInsnNode(Opcodes.INVOKESTATIC,
+                                "dev/horizonlab/wgpu/Agent", "withWgpu",
+                                "([L" + GPU_BACKEND + ";)[L" + GPU_BACKEND + ";", false));
+                    }
+                }
+                System.out.println("[horizon-wgpu] graphics backend: Horizon wgpu, then the game's own");
+                return true;
+            }
             if (m.name.equals("getBackendsToTry")) {
                 InsnList body = new InsnList();
                 body.add(new InsnNode(Opcodes.ICONST_1));
@@ -99,6 +123,58 @@ public final class Agent {
             }
         }
         return false;
+    }
+
+    /** Horizon's wgpu backend ahead of the game's {@code own}. */
+    public static com.mojang.renderpearl.api.device.GpuBackend[] withWgpu(
+            com.mojang.renderpearl.api.device.GpuBackend[] own) {
+        var all = new com.mojang.renderpearl.api.device.GpuBackend[own.length + 1];
+        all[0] = new WgpuBackend();
+        System.arraycopy(own, 0, all, 1, own.length);
+        return all;
+    }
+
+    /**
+     * Captures run with no one at the screen: {@code MessageBox.error} (the game's "no graphics backend could
+     * start" dialog, which waits for a click) prints the message and exits instead.
+     */
+    static boolean noDialog(ClassNode node) {
+        for (MethodNode m : node.methods) {
+            if (m.name.equals("error") && m.desc.equals("(Ljava/lang/String;)V")) {
+                InsnList body = new InsnList();
+                body.add(new VarInsnNode(Opcodes.ALOAD, 0));
+                body.add(new MethodInsnNode(Opcodes.INVOKESTATIC, "dev/horizonlab/wgpu/Capture", "dialog",
+                        "(Ljava/lang/String;)V", false));
+                body.add(new InsnNode(Opcodes.RETURN));
+                m.instructions = body;
+                m.tryCatchBlocks.clear();
+                m.localVariables = null;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Captures ignore the real mouse: a pointer someone leaves over the window would light up the button under it
+     * (or turn the camera) in one run and not the next.
+     */
+    static boolean noMouse(ClassNode node) {
+        boolean any = false;
+        for (MethodNode m : node.methods) {
+            if (switch (m.name) {
+                case "onMove", "onButton", "onScroll", "resyncMousePosition", "cursorEntered" -> m.desc.endsWith(")V");
+                default -> false;
+            }) {
+                InsnList body = new InsnList();
+                body.add(new InsnNode(Opcodes.RETURN));
+                m.instructions = body;
+                m.tryCatchBlocks.clear();
+                m.localVariables = null;
+                any = true;
+            }
+        }
+        return any;
     }
 
     /** {@code Capture.tick(this)} at the start of {@code Minecraft.runTick}. */

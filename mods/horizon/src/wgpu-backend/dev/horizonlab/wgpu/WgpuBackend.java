@@ -31,17 +31,23 @@ public final class WgpuBackend implements GpuBackend {
     @Override
     public void unloadLibrary() {}
 
-    /** A plain window: wgpu makes its own surface on it (no OpenGL context, no Vulkan flag). */
+    /**
+     * A plain window: wgpu makes its own surface on it (no OpenGL context, no Vulkan flag). On macOS a Metal one,
+     * as SDL wants for the Metal view {@link WindowTarget} puts on it.
+     */
     @Override
     public long createWindow(String title, int width, int height, long flags) {
-        return SDLVideo.SDL_CreateWindow(title, width, height, flags);
+        return SDLVideo.SDL_CreateWindow(title, width, height, flags | METAL);
     }
+
+    private static final long METAL = System.getProperty("os.name", "").toLowerCase().contains("mac")
+            ? SDLVideo.SDL_WINDOW_METAL : 0L;
 
     @Override
     public GpuDevice createDevice(GpuDebugOptions options) throws BackendCreationException {
         // The game makes its window after the device. A small hidden window of the same kind lets the device pick
         // an adapter, and a graphics API, that can present to it.
-        long probe = SDLVideo.SDL_CreateWindow("", 16, 16, SDLVideo.SDL_WINDOW_HIDDEN);
+        long probe = SDLVideo.SDL_CreateWindow("", 16, 16, SDLVideo.SDL_WINDOW_HIDDEN | METAL);
         try (java.lang.foreign.Arena arena = java.lang.foreign.Arena.ofConfined()) {
             java.lang.foreign.MemorySegment target = probe == 0L ? java.lang.foreign.MemorySegment.NULL
                     : WindowTarget.of(probe, arena);

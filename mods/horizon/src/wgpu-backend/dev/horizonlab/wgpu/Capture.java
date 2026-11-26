@@ -89,13 +89,14 @@ public final class Capture {
             double ms = (System.nanoTime() - first) / 1e6 / (frames - 1);
             Path out = Path.of(System.getProperty("hz.capture"));
             String backend = mc.getWindow().toString();
+            String api = com.mojang.blaze3d.systems.RenderSystem.getDevice().getDeviceInfo().backendName();
             Screenshot.takeScreenshot(mc.gameRenderer.mainRenderTarget(), (NativeImage image) -> {
                 try (image) {
                     image.writeToFile(out);
                     Files.writeString(Path.of(out + ".txt"), "frames\t" + frames + "\nms per frame\t"
                             + String.format("%.3f", ms) + "\nlongest tick gap ms\t"
                             + String.format("%.0f", longestGap / 1e6) + "\nsize\t" + image.getWidth() + "x" + image.getHeight()
-                            + "\nwindow\t" + backend + "\n", StandardCharsets.UTF_8);
+                            + "\nwindow\t" + backend + "\nbackend\t" + api + "\n", StandardCharsets.UTF_8);
                     System.out.println("[horizon-wgpu] frame saved to " + out);
                 } catch (IOException e) {
                     fail("saving the screenshot: " + e);
@@ -119,6 +120,11 @@ public final class Capture {
             e.printStackTrace(System.out);
             fail("capture: " + e);
         }
+    }
+
+    /** The game's error dialog, in a capture: see {@link Agent#noDialog}. */
+    public static void dialog(String message) {
+        fail("the game's error dialog: " + message);
     }
 
     private static void fail(String why) {
