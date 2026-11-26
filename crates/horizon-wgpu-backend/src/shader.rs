@@ -82,6 +82,117 @@ pub fn from_wgsl(text: &str) -> Result<Parsed, String> {
     })
 }
 
+/// The fragment shader `module` with each texture at a binding in `bindings` (sampled with nearest filtering and
+/// no mip levels past the first) sampled at the center of the texel it samples: `textureSample(t, s, uv)` and
+/// `textureSampleLevel(t, s, uv, l)` become `textureSampleLevel(t, s, center(t, uv), 0.0)`. With no levels past
+/// the first, that is the same texel.
+///
+/// For D3D12, where drivers (AMD's) round a nearest-sampled coordinate that lies on a texel edge to the next texel
+/// while Vulkan and OpenGL on the same GPU take the one below: the game draws its logo exactly 1:1, every
+/// coordinate on an edge, and its edges came out a texel off. A texel's center is the same texel on every API.
+/// (Mipmapped textures are left alone: sampling them with gradients the shader works out changes which level
+/// some pixels take.)
+///
+/// Done on WGSL text: samples whose texture comes in as a function argument are left as they are (the game's
+/// helpers that take a sampler place their coordinates themselves).
+pub fn snap_nearest(module: &Module, bindings: &[u32]) -> Result<Module, String> {
+    let info = naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::all(),
+    )
+    .validate(module)
+    .map_err(|e| format!("{e:?}"))?;
+    let text =
+        naga::back::wgsl::write_string(module, &info, naga::back::wgsl::WriterFlags::empty())
+            .map_err(|e| e.to_string())?;
+    // The 2D float textures at those bindings, by name: `@group(g) @binding(b) var name: texture_2d<f32>;`.
+    let mut names = Vec::new();
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find("@binding(") {
+        rest = &rest[at + "@binding(".len()..];
+        let binding: u32 = rest[..rest.find(')').unwrap_or(0)]
+            .parse()
+            .unwrap_or(u32::MAX);
+        let Some(var) = rest.find("var ") else { break };
+        let decl = &rest[var + 4..rest[var..].find(';').map_or(rest.len(), |e| var + e)];
+        if let Some((name, ty)) = decl.split_once(':')
+            && ty.trim() == "texture_2d<f32>"
+            && bindings.contains(&binding)
+        {
+            names.push(name.trim().to_string());
+        }
+    }
+    if names.is_empty() {
+        return Ok(module.clone());
+    }
+    let mut out = String::with_capacity(text.len() + 512);
+    let mut rest = text.as_str();
+    let mut changed = false;
+    while let Some(at) = rest.find("textureSample") {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let (call, level) = if rest.starts_with("textureSample(") {
+            ("textureSample(", false)
+        } else if rest.starts_with("textureSampleLevel(") {
+            ("textureSampleLevel(", true)
+        } else {
+            out.push_str("textureSample");
+            rest = &rest["textureSample".len()..];
+            continue;
+        };
+        let args_at = call.len();
+        let Some((args, len)) = call_arguments(&rest[args_at..]) else {
+            out.push_str(call);
+            rest = &rest[args_at..];
+            continue;
+        };
+        let wanted = if level { 4 } else { 3 };
+        if args.len() == wanted && names.iter().any(|n| n == args[0]) {
+            let (t, sampler, uv) = (args[0], args[1], args[2]);
+            out.push_str(&format!(
+                "textureSampleLevel({t}, {sampler}, hz_texel_center({t}, {uv}), 0.0)"
+            ));
+            changed = true;
+        } else {
+            out.push_str(&rest[..args_at + len]);
+        }
+        rest = &rest[args_at + len..];
+    }
+    out.push_str(rest);
+    if !changed {
+        return Ok(module.clone());
+    }
+    out.push_str(
+        "\nfn hz_texel_center(t: texture_2d<f32>, uv: vec2<f32>) -> vec2<f32> {\n    \
+         let size = vec2<f32>(textureDimensions(t));\n    return (floor(uv * size) + 0.5) / size;\n}\n",
+    );
+    Ok(from_wgsl(&out)?.module)
+}
+
+/// The top-level arguments of a call whose text starts just after its `(`, and the length up to and with its
+/// `)`.
+fn call_arguments(text: &str) -> Option<(Vec<&str>, usize)> {
+    let mut depth = 0usize;
+    let mut start = 0;
+    let mut args = Vec::new();
+    for (i, c) in text.char_indices() {
+        match c {
+            '(' | '[' => depth += 1,
+            ')' | ']' if depth > 0 => depth -= 1,
+            ')' => {
+                args.push(text[start..i].trim());
+                return Some((args, i + 1));
+            }
+            ',' if depth == 0 => {
+                args.push(text[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Each resource the module declares: (group, binding, kind).
 fn resources(module: &Module) -> Result<Vec<(u32, u32, Resource)>, String> {
     let mut resources = Vec::new();

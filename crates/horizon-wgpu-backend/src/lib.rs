@@ -51,6 +51,8 @@ pub struct Ctx {
     prof: Option<Prof>,
     /// The thread that hands the queue its work (see [`Sender`]).
     sender: Sender,
+    /// D3D12: nearest-sampled textures are sampled at the texel's center (see [`VariantKey::snap`]).
+    snap_nearest: bool,
     pass: Option<Pass>,
     /// Transient regions written since the last submit: (buffer, offset, bytes).
     dirty: Vec<(wgpu::Buffer, u64, Vec<u8>)>,
@@ -129,12 +131,17 @@ pub struct Sampler {
     sampler: wgpu::Sampler,
     /// The same with nearest filtering, for a texture that cannot be filtered (depth, 32-bit float).
     nearest: wgpu::Sampler,
+    /// Whether it samples the nearest texel of the first level alone: nearest filtering both ways, no mip
+    /// levels past the first (see [`VariantKey::snap`]).
+    point: bool,
 }
 
 pub struct Pipeline {
     name: String,
     vertex: wgpu::ShaderModule,
     fragment: wgpu::ShaderModule,
+    /// The fragment shader as naga IR, for variants that change it (see [`VariantKey::snap`]).
+    fragment_ir: naga::Module,
     resources: Vec<(u32, u32, Resource)>,
     buffers: Vec<(u64, wgpu::VertexStepMode, Vec<wgpu::VertexAttribute>)>,
     immediates: u32,
@@ -154,6 +161,9 @@ struct VariantKey {
     depth: Option<TextureFormat>,
     /// Uniform indices whose bound texture cannot be filtered.
     unfilterable: Vec<u32>,
+    /// On D3D12, uniform indices whose texture is sampled at the nearest texel of its first level: the fragment
+    /// shader samples them at the texel's center (see [`shader::snap_nearest`]).
+    snap: Vec<u32>,
 }
 
 struct Variant {
@@ -169,7 +179,8 @@ struct Variant {
 #[derive(Clone)]
 enum Bound {
     Buffer(wgpu::Buffer, u64, u64),
-    Texture(Rc<View>, wgpu::Sampler, wgpu::Sampler),
+    /// The view, its sampler, the sampler's nearest twin, and whether the sampler is nearest.
+    Texture(Rc<View>, wgpu::Sampler, wgpu::Sampler, bool),
 }
 
 /// A bind group's identity: its layout and, by binding, what goes there.
@@ -882,6 +893,12 @@ pub unsafe extern "C" fn hz_create(probe: *const c_void) -> *mut Ctx {
     let belt = wgpu::util::StagingBelt::new(device.clone(), 4 << 20);
     let completed = Arc::new(AtomicU64::new(0));
     let sender = Sender::new(queue.clone(), completed.clone());
+    // HZ_WGPU_SNAP=0 or 1 turns it off, or on for any API.
+    let snap_nearest = match env("HZ_WGPU_SNAP") {
+        Some("0") => false,
+        Some("1") => true,
+        _ => adapter.get_info().backend == wgpu::Backend::Dx12,
+    };
     Box::into_raw(Box::new(Ctx {
         instance,
         adapter,
@@ -892,6 +909,7 @@ pub unsafe extern "C" fn hz_create(probe: *const c_void) -> *mut Ctx {
         deferred: false,
         prof: env("HZ_WGPU_PROFILE").map(|_| Prof::new()),
         sender,
+        snap_nearest,
         pass: None,
         dirty: Vec::new(),
         serial: 0,
@@ -2203,7 +2221,11 @@ pub unsafe extern "C" fn hz_sampler_create(
             anisotropy_clamp: 1,
             ..desc
         });
-        Ok(Box::into_raw(Box::new(Sampler { sampler, nearest })))
+        Ok(Box::into_raw(Box::new(Sampler {
+            sampler,
+            nearest,
+            point: min == 0 && mag == 0 && lod <= 0.25,
+        })))
     })
 }
 
@@ -2375,6 +2397,7 @@ pub unsafe extern "C" fn hz_pipeline_create(
                 resources.push(*r);
             }
         }
+        let fragment_ir = f.module.clone();
         let (vertex, fragment) = on_big_stack(|| {
             (
                 device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -2464,6 +2487,7 @@ pub unsafe extern "C" fn hz_pipeline_create(
             name,
             vertex,
             fragment,
+            fragment_ir,
             resources,
             buffers: buffers.into_iter().map(|b| (b.1, b.2, b.3)).collect(),
             immediates,
@@ -2699,6 +2723,18 @@ impl Pipeline {
             })
             .collect();
         let (compare, write, scale, constant) = self.depth;
+        let snapped = (!key.snap.is_empty())
+            .then(|| shader::snap_nearest(&self.fragment_ir, &key.snap))
+            .and_then(|r| {
+                r.map_err(|e| eprintln!("[horizon-wgpu] {}: texel centers: {e}", self.name))
+                    .ok()
+            })
+            .map(|m| {
+                device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some(&self.name),
+                    source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(m)),
+                })
+            });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(&self.name),
             layout: Some(&layout),
@@ -2735,7 +2771,7 @@ impl Pipeline {
             }),
             multisample: Default::default(),
             fragment: Some(wgpu::FragmentState {
-                module: &self.fragment,
+                module: snapped.as_ref().unwrap_or(&self.fragment),
                 entry_point: Some("main"),
                 compilation_options: Default::default(),
                 targets: &targets,
@@ -3049,7 +3085,12 @@ pub unsafe extern "C" fn hz_pass_texture(
         let pass = pass(ctx)?;
         pass.bound.insert(
             index,
-            Bound::Texture(view, sampler.sampler.clone(), sampler.nearest.clone()),
+            Bound::Texture(
+                view,
+                sampler.sampler.clone(),
+                sampler.nearest.clone(),
+                sampler.point,
+            ),
         );
         pass.dirty = true;
         Ok(())
@@ -3166,6 +3207,7 @@ pub unsafe extern "C" fn hz_pass_index(ctx: *mut Ctx, buf: *const Buf, int32: u3
 #[allow(clippy::mutable_key_type)]
 fn prepare(ctx: &mut Ctx) -> Result<(), String> {
     let device = ctx.device.clone();
+    let snaps = ctx.snap_nearest;
     let serial = ctx.serial + 1;
     let groups = &mut ctx.groups;
     let pass = ctx
@@ -3185,10 +3227,23 @@ fn prepare(ctx: &mut Ctx) -> Result<(), String> {
         })
         .collect();
     unfilterable.sort_unstable();
+    let mut snap: Vec<u32> = if snaps {
+        pass.bound
+            .iter()
+            .filter_map(|(&i, b)| match b {
+                Bound::Texture(.., true) => Some(i),
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    snap.sort_unstable();
     let key = VariantKey {
         colors: pass.colors.clone(),
         depth: pass.depth,
         unfilterable,
+        snap,
     };
     // Creating a variant compiles shaders (deep stacks: see on_big_stack); finding one made before does not.
     let cached = pipeline.variants.borrow().get(&key).cloned();
@@ -3238,7 +3293,7 @@ fn prepare(ctx: &mut Ctx) -> Result<(), String> {
                     let view = v.sampled(view_dimension(dim, arrayed));
                     views.push((binding, view));
                 }
-                (Resource::Sampler { .. }, Bound::Texture(v, filtering, nearest)) => {
+                (Resource::Sampler { .. }, Bound::Texture(v, filtering, nearest, _)) => {
                     let sampler = if format::filterable(v.format) {
                         filtering.clone()
                     } else {
